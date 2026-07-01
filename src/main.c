@@ -98,6 +98,11 @@ static bool g_timer_precision_active = false;
 static HDC g_canvas_dc;
 static HBITMAP g_canvas_bitmap;
 static HGDIOBJ g_canvas_old_bitmap;
+static HDC g_cursor_dc;
+static HBITMAP g_cursor_bitmap;
+static HGDIOBJ g_cursor_old_bitmap;
+static int g_cursor_bitmap_w = 0;
+static int g_cursor_bitmap_h = 0;
 static int g_canvas_x = 0;
 static int g_canvas_y = 0;
 static int g_canvas_w = 0;
@@ -109,6 +114,8 @@ static LARGE_INTEGER g_qpc_frequency;
 static LARGE_INTEGER g_profile_start_time;
 static LARGE_INTEGER g_profile_last_flush_time;
 static ProfileStats g_profile;
+
+static void ReleaseCursorBitmapResources(void);
 
 static void SetLatencyPriority(void)
 {
@@ -356,6 +363,8 @@ static void DeleteIconInfoBitmaps(ICONINFO *icon_info)
 
 static void UpdateCursorMetrics(HCURSOR cursor)
 {
+    ReleaseCursorBitmapResources();
+
     g_cursor.handle = cursor;
     g_cursor.width = GetSystemMetrics(SM_CXCURSOR);
     g_cursor.height = GetSystemMetrics(SM_CYCURSOR);
@@ -428,6 +437,96 @@ static void ReleaseCanvasResources(void)
     g_canvas_w = 0;
     g_canvas_h = 0;
     g_have_rendered_cursor = false;
+}
+
+static void ReleaseCursorBitmapResources(void)
+{
+    if (g_cursor_dc && g_cursor_old_bitmap) {
+        SelectObject(g_cursor_dc, g_cursor_old_bitmap);
+    }
+
+    if (g_cursor_bitmap) {
+        DeleteObject(g_cursor_bitmap);
+        g_cursor_bitmap = NULL;
+    }
+
+    if (g_cursor_dc) {
+        DeleteDC(g_cursor_dc);
+        g_cursor_dc = NULL;
+    }
+
+    g_cursor_old_bitmap = NULL;
+    g_cursor_bitmap_w = 0;
+    g_cursor_bitmap_h = 0;
+}
+
+static bool EnsureCursorBitmapResources(void)
+{
+    if (!g_cursor.handle || g_cursor.width <= 0 || g_cursor.height <= 0) {
+        return false;
+    }
+
+    if (g_cursor_dc &&
+        g_cursor_bitmap &&
+        g_cursor_bitmap_w == g_cursor.width &&
+        g_cursor_bitmap_h == g_cursor.height) {
+        return true;
+    }
+
+    ReleaseCursorBitmapResources();
+
+    g_cursor_dc = CreateCompatibleDC(NULL);
+    if (!g_cursor_dc) {
+        return false;
+    }
+
+    BITMAPINFO bitmap_info;
+    ZeroMemory(&bitmap_info, sizeof(bitmap_info));
+    bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+    bitmap_info.bmiHeader.biWidth = g_cursor.width;
+    bitmap_info.bmiHeader.biHeight = -g_cursor.height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+    g_cursor_bitmap = CreateDIBSection(
+        g_cursor_dc,
+        &bitmap_info,
+        DIB_RGB_COLORS,
+        NULL,
+        NULL,
+        0);
+
+    if (!g_cursor_bitmap) {
+        ReleaseCursorBitmapResources();
+        return false;
+    }
+
+    g_cursor_old_bitmap = SelectObject(g_cursor_dc, g_cursor_bitmap);
+    if (!g_cursor_old_bitmap) {
+        ReleaseCursorBitmapResources();
+        return false;
+    }
+
+    RECT rect = {0, 0, g_cursor.width, g_cursor.height};
+    HBRUSH brush = CreateSolidBrush(TRANSPARENT_COLOR);
+    FillRect(g_cursor_dc, &rect, brush);
+    DeleteObject(brush);
+
+    DrawIconEx(
+        g_cursor_dc,
+        0,
+        0,
+        g_cursor.handle,
+        g_cursor.width,
+        g_cursor.height,
+        0,
+        NULL,
+        DI_NORMAL);
+
+    g_cursor_bitmap_w = g_cursor.width;
+    g_cursor_bitmap_h = g_cursor.height;
+    return true;
 }
 
 static bool EnsureCanvasResources(int width, int height)
@@ -516,7 +615,7 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     }
 
     int canvas_size = CursorCanvasSize();
-    if (!EnsureCanvasResources(canvas_size, canvas_size)) {
+    if (!EnsureCanvasResources(canvas_size, canvas_size) || !EnsureCursorBitmapResources()) {
         ++g_profile.render_fail;
         ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return false;
@@ -555,16 +654,16 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     int image_y = cursor_pos.y - g_cursor.hotspot_y - g_canvas_y;
 
     step_start = ProfileNow();
-    DrawIconEx(
+    BitBlt(
         g_canvas_dc,
         image_x,
         image_y,
-        g_cursor.handle,
         g_cursor.width,
         g_cursor.height,
+        g_cursor_dc,
         0,
-        NULL,
-        DI_NORMAL);
+        0,
+        SRCCOPY);
     ProfileAddDuration(&g_profile.draw_icon, step_start, ProfileNow());
 
     step_start = ProfileNow();
@@ -934,6 +1033,7 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
             g_overlay_hwnd = NULL;
         }
         ReleaseCanvasResources();
+        ReleaseCursorBitmapResources();
         PostQuitMessage(0);
         return 0;
     }

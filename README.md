@@ -32,6 +32,7 @@ build\DrawCursor.exe
 - Raw Input 驱动位置刷新，不使用低级鼠标 hook。
 - GDI 友好固定画布模式：覆盖层是 384x384 的透明画布，鼠标在画布内移动时不移动窗口，只清空画布并画一次当前鼠标。
 - 只有鼠标接近画布边缘 32px 时才重新居中覆盖层，减少 GDI 采集中的窗口移动残影。
+- 鼠标样式变化时才用 `DrawIconEx` 生成缓存；普通移动帧只把缓存图像复制到画布，避免每帧 `DrawIconEx` 抖动。
 - Raw Input 只作为高频位置采样，显示层按 4ms 刷新，并且每次只渲染最新位置，避免旧位置帧排队。
 - 运动停止约 20ms 后自动停止高频刷新，回到低频状态检查。
 - 不使用运动预测，避免远程端看到前冲。
@@ -47,4 +48,4 @@ build\DrawCursor.exe
 build\logs\drawcursor-profile.csv
 ```
 
-每秒一行，记录输入事件数量、渲染请求数量、渲染 timer tick、画布重居中次数，以及 `GetCursorPos`、`DrawIconEx`、`UpdateLayeredWindow` 和整帧渲染耗时。退出 DrawCursor 时会强制 flush 最后一行。
+每秒一行，记录输入事件数量、渲染请求数量、渲染 timer tick、画布重居中次数，以及 `GetCursorPos`、鼠标图像复制、`UpdateLayeredWindow` 和整帧渲染耗时。退出 DrawCursor 时会强制 flush 最后一行。
