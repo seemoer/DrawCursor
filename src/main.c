@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #define APP_NAME L"DrawCursor"
 #define MAIN_CLASS_NAME L"DrawCursor.MainWindow"
@@ -49,6 +50,37 @@ typedef struct CursorMetrics {
     int hotspot_y;
 } CursorMetrics;
 
+typedef struct DurationStats {
+    ULONGLONG count;
+    ULONGLONG total_us;
+    ULONGLONG max_us;
+} DurationStats;
+
+typedef struct ProfileStats {
+    ULONGLONG input_events;
+    ULONGLONG render_requests;
+    ULONGLONG render_timer_ticks;
+    ULONGLONG state_timer_ticks;
+    ULONGLONG render_attempts;
+    ULONGLONG render_success;
+    ULONGLONG render_fail;
+    ULONGLONG render_noop_same_pos;
+    ULONGLONG render_force;
+    ULONGLONG canvas_recenter;
+    ULONGLONG canvas_recreated;
+    ULONGLONG cursor_changed;
+    ULONGLONG cursor_hidden;
+    ULONGLONG timer_started;
+    ULONGLONG timer_stopped;
+    ULONGLONG overlay_shown;
+    DurationStats get_cursor_pos;
+    DurationStats fill_canvas;
+    DurationStats draw_icon;
+    DurationStats get_screen_dc;
+    DurationStats update_layered;
+    DurationStats render_total;
+} ProfileStats;
+
 static HINSTANCE g_instance;
 static HWND g_main_hwnd;
 static HWND g_overlay_hwnd;
@@ -72,6 +104,11 @@ static int g_canvas_w = 0;
 static int g_canvas_h = 0;
 static POINT g_last_rendered_cursor_pos = {0, 0};
 static bool g_have_rendered_cursor = false;
+static HANDLE g_profile_file = INVALID_HANDLE_VALUE;
+static LARGE_INTEGER g_qpc_frequency;
+static LARGE_INTEGER g_profile_start_time;
+static LARGE_INTEGER g_profile_last_flush_time;
+static ProfileStats g_profile;
 
 static void SetLatencyPriority(void)
 {
@@ -118,6 +155,170 @@ static void EndTimerPrecision(void)
         g_winmm = NULL;
         g_time_begin_period = NULL;
         g_time_end_period = NULL;
+    }
+}
+
+static LARGE_INTEGER ProfileNow(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now;
+}
+
+static ULONGLONG ProfileElapsedUs(LARGE_INTEGER start, LARGE_INTEGER end)
+{
+    if (g_qpc_frequency.QuadPart <= 0) {
+        return 0;
+    }
+
+    return (ULONGLONG)(((end.QuadPart - start.QuadPart) * 1000000LL) / g_qpc_frequency.QuadPart);
+}
+
+static void ProfileAddDuration(DurationStats *stats, LARGE_INTEGER start, LARGE_INTEGER end)
+{
+    ULONGLONG elapsed_us = ProfileElapsedUs(start, end);
+    ++stats->count;
+    stats->total_us += elapsed_us;
+    if (elapsed_us > stats->max_us) {
+        stats->max_us = elapsed_us;
+    }
+}
+
+static ULONGLONG ProfileAvgUs(DurationStats stats)
+{
+    return stats.count ? stats.total_us / stats.count : 0;
+}
+
+static void ProfileWrite(const char *text)
+{
+    if (g_profile_file == INVALID_HANDLE_VALUE || !text) {
+        return;
+    }
+
+    DWORD bytes_written = 0;
+    WriteFile(g_profile_file, text, (DWORD)lstrlenA(text), &bytes_written, NULL);
+}
+
+static void ProfileBuildLogPath(WCHAR *path, DWORD path_count)
+{
+    DWORD len = GetModuleFileNameW(NULL, path, path_count);
+    if (len == 0 || len >= path_count) {
+        lstrcpynW(path, L"drawcursor-profile.csv", path_count);
+        return;
+    }
+
+    for (DWORD i = len; i > 0; --i) {
+        if (path[i - 1] == L'\\' || path[i - 1] == L'/') {
+            path[i] = L'\0';
+            break;
+        }
+    }
+
+    WCHAR log_dir[MAX_PATH];
+    lstrcpynW(log_dir, path, ARRAYSIZE(log_dir));
+    lstrcatW(log_dir, L"logs");
+    CreateDirectoryW(log_dir, NULL);
+
+    lstrcatW(path, L"logs\\drawcursor-profile.csv");
+}
+
+static void ProfileFlush(bool force)
+{
+    if (g_profile_file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    LARGE_INTEGER now = ProfileNow();
+    ULONGLONG interval_us = ProfileElapsedUs(g_profile_last_flush_time, now);
+    if (!force && interval_us < 1000000ULL) {
+        return;
+    }
+
+    ULONGLONG since_start_ms = ProfileElapsedUs(g_profile_start_time, now) / 1000ULL;
+    char line[2048];
+    int len = snprintf(
+        line,
+        sizeof(line),
+        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
+        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
+        since_start_ms,
+        interval_us / 1000ULL,
+        g_profile.input_events,
+        g_profile.render_requests,
+        g_profile.render_timer_ticks,
+        g_profile.state_timer_ticks,
+        g_profile.render_attempts,
+        g_profile.render_success,
+        g_profile.render_fail,
+        g_profile.render_noop_same_pos,
+        g_profile.render_force,
+        g_profile.canvas_recenter,
+        g_profile.canvas_recreated,
+        g_profile.cursor_changed,
+        g_profile.cursor_hidden,
+        g_profile.timer_started,
+        g_profile.timer_stopped,
+        g_profile.overlay_shown,
+        ProfileAvgUs(g_profile.get_cursor_pos),
+        g_profile.get_cursor_pos.max_us,
+        ProfileAvgUs(g_profile.fill_canvas),
+        g_profile.fill_canvas.max_us,
+        ProfileAvgUs(g_profile.draw_icon),
+        g_profile.draw_icon.max_us,
+        ProfileAvgUs(g_profile.get_screen_dc),
+        g_profile.get_screen_dc.max_us,
+        ProfileAvgUs(g_profile.update_layered),
+        g_profile.update_layered.max_us,
+        ProfileAvgUs(g_profile.render_total),
+        g_profile.render_total.max_us,
+        g_profile.update_layered.count,
+        g_profile.render_total.count);
+
+    if (len > 0) {
+        ProfileWrite(line);
+        FlushFileBuffers(g_profile_file);
+    }
+
+    ZeroMemory(&g_profile, sizeof(g_profile));
+    g_profile_last_flush_time = now;
+}
+
+static void ProfileInit(void)
+{
+    QueryPerformanceFrequency(&g_qpc_frequency);
+    g_profile_start_time = ProfileNow();
+    g_profile_last_flush_time = g_profile_start_time;
+
+    WCHAR path[MAX_PATH];
+    ProfileBuildLogPath(path, ARRAYSIZE(path));
+    g_profile_file = CreateFileW(
+        path,
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+
+    if (g_profile_file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    ProfileWrite(
+        "since_start_ms,interval_ms,input_events,render_requests,render_timer_ticks,state_timer_ticks,"
+        "render_attempts,render_success,render_fail,render_noop_same_pos,render_force,canvas_recenter,"
+        "canvas_recreated,cursor_changed,cursor_hidden,timer_started,timer_stopped,overlay_shown,"
+        "getcursor_avg_us,getcursor_max_us,fill_avg_us,fill_max_us,drawicon_avg_us,drawicon_max_us,"
+        "getdc_avg_us,getdc_max_us,update_layered_avg_us,update_layered_max_us,render_total_avg_us,"
+        "render_total_max_us,update_layered_calls,render_total_calls\n");
+}
+
+static void ProfileClose(void)
+{
+    ProfileFlush(true);
+    if (g_profile_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_profile_file);
+        g_profile_file = INVALID_HANDLE_VALUE;
     }
 }
 
@@ -272,6 +473,7 @@ static bool EnsureCanvasResources(int width, int height)
 
     g_canvas_w = width;
     g_canvas_h = height;
+    ++g_profile.canvas_recreated;
     return true;
 }
 
@@ -301,12 +503,22 @@ static bool CursorFitsCanvas(POINT cursor_pos)
 
 static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
 {
+    LARGE_INTEGER render_start = ProfileNow();
+    ++g_profile.render_attempts;
+    if (force_update) {
+        ++g_profile.render_force;
+    }
+
     if (!g_redraw_enabled || !g_overlay_hwnd || !g_cursor_showing || !g_cursor.handle) {
+        ++g_profile.render_fail;
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return false;
     }
 
     int canvas_size = CursorCanvasSize();
     if (!EnsureCanvasResources(canvas_size, canvas_size)) {
+        ++g_profile.render_fail;
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return false;
     }
 
@@ -317,6 +529,7 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         !CursorFitsCanvas(cursor_pos);
 
     if (recenter_canvas) {
+        ++g_profile.canvas_recenter;
         g_canvas_x = cursor_pos.x - canvas_size / 2;
         g_canvas_y = cursor_pos.y - canvas_size / 2;
     }
@@ -326,17 +539,22 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         g_have_rendered_cursor &&
         cursor_pos.x == g_last_rendered_cursor_pos.x &&
         cursor_pos.y == g_last_rendered_cursor_pos.y) {
+        ++g_profile.render_noop_same_pos;
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return true;
     }
 
+    LARGE_INTEGER step_start = ProfileNow();
     RECT rect = {0, 0, g_canvas_w, g_canvas_h};
     HBRUSH brush = CreateSolidBrush(TRANSPARENT_COLOR);
     FillRect(g_canvas_dc, &rect, brush);
     DeleteObject(brush);
+    ProfileAddDuration(&g_profile.fill_canvas, step_start, ProfileNow());
 
     int image_x = cursor_pos.x - g_cursor.hotspot_x - g_canvas_x;
     int image_y = cursor_pos.y - g_cursor.hotspot_y - g_canvas_y;
 
+    step_start = ProfileNow();
     DrawIconEx(
         g_canvas_dc,
         image_x,
@@ -347,15 +565,21 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         0,
         NULL,
         DI_NORMAL);
+    ProfileAddDuration(&g_profile.draw_icon, step_start, ProfileNow());
 
+    step_start = ProfileNow();
     HDC screen_dc = GetDC(NULL);
+    ProfileAddDuration(&g_profile.get_screen_dc, step_start, ProfileNow());
     if (!screen_dc) {
+        ++g_profile.render_fail;
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return false;
     }
 
     POINT dst = {g_canvas_x, g_canvas_y};
     POINT src = {0, 0};
     SIZE size = {g_canvas_w, g_canvas_h};
+    step_start = ProfileNow();
     BOOL ok = UpdateLayeredWindow(
         g_overlay_hwnd,
         screen_dc,
@@ -366,10 +590,13 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         TRANSPARENT_COLOR,
         NULL,
         ULW_COLORKEY);
+    ProfileAddDuration(&g_profile.update_layered, step_start, ProfileNow());
 
     ReleaseDC(NULL, screen_dc);
 
     if (!ok) {
+        ++g_profile.render_fail;
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return false;
     }
 
@@ -384,17 +611,24 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW);
         ShowWindow(g_overlay_hwnd, SW_SHOWNOACTIVATE);
         g_overlay_visible = true;
+        ++g_profile.overlay_shown;
     }
 
     g_last_rendered_cursor_pos = cursor_pos;
     g_have_rendered_cursor = true;
+    ++g_profile.render_success;
+    ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
     return true;
 }
 
 static void RenderCursorAtCurrentPosition(bool force_update)
 {
+    LARGE_INTEGER step_start = ProfileNow();
     POINT cursor_pos;
-    if (GetCursorPos(&cursor_pos)) {
+    BOOL got_cursor = GetCursorPos(&cursor_pos);
+    ProfileAddDuration(&g_profile.get_cursor_pos, step_start, ProfileNow());
+
+    if (got_cursor) {
         RenderCursorCanvas(cursor_pos, force_update);
     }
 }
@@ -403,6 +637,7 @@ static void StopRenderTimer(void)
 {
     if (g_render_timer_active && g_main_hwnd) {
         KillTimer(g_main_hwnd, TIMER_RENDER);
+        ++g_profile.timer_stopped;
     }
 
     g_render_timer_active = false;
@@ -413,6 +648,7 @@ static void StartRenderTimer(void)
     if (!g_render_timer_active && g_main_hwnd) {
         SetTimer(g_main_hwnd, TIMER_RENDER, RENDER_INTERVAL_MS, NULL);
         g_render_timer_active = true;
+        ++g_profile.timer_started;
     }
 }
 
@@ -422,6 +658,7 @@ static void RequestCursorRender(void)
         return;
     }
 
+    ++g_profile.render_requests;
     g_last_input_tick = GetTickCount();
 
     if (!g_render_timer_active) {
@@ -449,6 +686,7 @@ static void SyncCursorState(void)
         g_cursor_showing = false;
         g_have_rendered_cursor = false;
         StopRenderTimer();
+        ++g_profile.cursor_hidden;
         SetOverlayVisible(false);
         return;
     }
@@ -457,6 +695,7 @@ static void SyncCursorState(void)
 
     bool cursor_changed = cursor_info.hCursor != g_cursor.handle;
     if (cursor_changed) {
+        ++g_profile.cursor_changed;
         UpdateCursorMetrics(cursor_info.hCursor);
     }
 
@@ -637,23 +876,29 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
         return 0;
 
     case WM_INPUT:
+        ++g_profile.input_events;
         if (g_redraw_enabled) {
             RequestCursorRender();
         }
+        ProfileFlush(false);
         return DefWindowProcW(hwnd, message, wparam, lparam);
 
     case WM_TIMER:
         if (wparam == TIMER_CURSOR) {
+            ++g_profile.state_timer_ticks;
             SyncCursorState();
+            ProfileFlush(false);
             return 0;
         }
         if (wparam == TIMER_RENDER) {
+            ++g_profile.render_timer_ticks;
             if (g_redraw_enabled && GetTickCount() - g_last_input_tick <= MOTION_IDLE_MS) {
                 RenderCursorAtCurrentPosition(false);
             } else {
                 RenderCursorAtCurrentPosition(false);
                 StopRenderTimer();
             }
+            ProfileFlush(false);
             return 0;
         }
         break;
@@ -743,9 +988,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
     SetBestDpiAwareness();
     SetLatencyPriority();
     BeginTimerPrecision();
+    ProfileInit();
 
     if (!RegisterWindowClasses()) {
         MessageBoxW(NULL, L"窗口类注册失败。", APP_NAME, MB_OK | MB_ICONERROR);
+        ProfileClose();
         EndTimerPrecision();
         CloseHandle(mutex);
         return 1;
@@ -767,6 +1014,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
 
     if (!hwnd) {
         MessageBoxW(NULL, L"DrawCursor 启动失败。", APP_NAME, MB_OK | MB_ICONERROR);
+        ProfileClose();
         EndTimerPrecision();
         CloseHandle(mutex);
         return 1;
@@ -778,6 +1026,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
         DispatchMessageW(&message);
     }
 
+    ProfileClose();
     EndTimerPrecision();
     CloseHandle(mutex);
     return (int)message.wParam;

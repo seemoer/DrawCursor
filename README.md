@@ -38,3 +38,13 @@ build\DrawCursor.exe
 - 进程和主线程使用 Above Normal 优先级降低调度抖动。
 - 50ms 定时器只做显隐和样式变化检查，不参与鼠标跟随。
 - 启用 DPI 感知，尽量保证多显示器和缩放环境下的位置准确。
+
+## Profiling
+
+程序运行时会写入低开销聚合日志：
+
+```text
+build\logs\drawcursor-profile.csv
+```
+
+每秒一行，记录输入事件数量、渲染请求数量、渲染 timer tick、画布重居中次数，以及 `GetCursorPos`、`DrawIconEx`、`UpdateLayeredWindow` 和整帧渲染耗时。退出 DrawCursor 时会强制 flush 最后一行。
