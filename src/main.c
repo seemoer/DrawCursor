@@ -12,6 +12,7 @@
 #include <shellapi.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define APP_NAME L"DrawCursor"
 #define MAIN_CLASS_NAME L"DrawCursor.MainWindow"
@@ -31,7 +32,6 @@
 #define IDM_EXIT 1003
 
 #define TRAY_ICON_ID 1
-#define TRANSPARENT_COLOR RGB(255, 0, 255)
 
 typedef HANDLE DPI_AWARENESS_CONTEXT;
 typedef BOOL(WINAPI *SetProcessDpiAwarenessContextFn)(DPI_AWARENESS_CONTEXT);
@@ -81,6 +81,11 @@ typedef struct ProfileStats {
     DurationStats render_total;
 } ProfileStats;
 
+typedef struct BitmapInfo1bpp {
+    BITMAPINFOHEADER bmiHeader;
+    RGBQUAD bmiColors[2];
+} BitmapInfo1bpp;
+
 static HINSTANCE g_instance;
 static HWND g_main_hwnd;
 static HWND g_overlay_hwnd;
@@ -98,9 +103,11 @@ static bool g_timer_precision_active = false;
 static HDC g_canvas_dc;
 static HBITMAP g_canvas_bitmap;
 static HGDIOBJ g_canvas_old_bitmap;
+static DWORD *g_canvas_pixels;
 static HDC g_cursor_dc;
 static HBITMAP g_cursor_bitmap;
 static HGDIOBJ g_cursor_old_bitmap;
+static DWORD *g_cursor_pixels;
 static int g_cursor_bitmap_w = 0;
 static int g_cursor_bitmap_h = 0;
 static int g_canvas_x = 0;
@@ -417,6 +424,291 @@ static int MaxInt(int a, int b)
     return a > b ? a : b;
 }
 
+static DWORD PremultiplyPixel(DWORD pixel)
+{
+    BYTE alpha = (BYTE)(pixel >> 24);
+    if (alpha == 0) {
+        return 0;
+    }
+    if (alpha == 255) {
+        return pixel;
+    }
+
+    BYTE red = (BYTE)(pixel >> 16);
+    BYTE green = (BYTE)(pixel >> 8);
+    BYTE blue = (BYTE)pixel;
+
+    red = (BYTE)((red * alpha + 127) / 255);
+    green = (BYTE)((green * alpha + 127) / 255);
+    blue = (BYTE)((blue * alpha + 127) / 255);
+
+    return ((DWORD)alpha << 24) | ((DWORD)red << 16) | ((DWORD)green << 8) | blue;
+}
+
+static bool BitmapNeedsPremultiply(const DWORD *pixels, int count)
+{
+    for (int i = 0; i < count; ++i) {
+        BYTE alpha = (BYTE)(pixels[i] >> 24);
+        if (alpha > 0 && alpha < 255) {
+            BYTE red = (BYTE)(pixels[i] >> 16);
+            BYTE green = (BYTE)(pixels[i] >> 8);
+            BYTE blue = (BYTE)pixels[i];
+            if (red > alpha || green > alpha || blue > alpha) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool ReadBitmap32(HBITMAP bitmap, int width, int height, DWORD *pixels)
+{
+    if (!bitmap || width <= 0 || height <= 0 || !pixels) {
+        return false;
+    }
+
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) {
+        return false;
+    }
+
+    BITMAPINFO bitmap_info;
+    ZeroMemory(&bitmap_info, sizeof(bitmap_info));
+    bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+    bitmap_info.bmiHeader.biWidth = width;
+    bitmap_info.bmiHeader.biHeight = -height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+    int rows = GetDIBits(
+        dc,
+        bitmap,
+        0,
+        (UINT)height,
+        pixels,
+        &bitmap_info,
+        DIB_RGB_COLORS);
+
+    DeleteDC(dc);
+    return rows == height;
+}
+
+static BYTE *ReadMonoMaskBits(HBITMAP bitmap, int width, int height, int *stride_out)
+{
+    if (!bitmap || width <= 0 || height <= 0 || !stride_out) {
+        return NULL;
+    }
+
+    int stride = ((width + 31) / 32) * 4;
+    size_t bytes = (size_t)stride * (size_t)height;
+    BYTE *bits = (BYTE *)malloc(bytes);
+    if (!bits) {
+        return NULL;
+    }
+
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) {
+        free(bits);
+        return NULL;
+    }
+
+    BitmapInfo1bpp bitmap_info;
+    ZeroMemory(&bitmap_info, sizeof(bitmap_info));
+    bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+    bitmap_info.bmiHeader.biWidth = width;
+    bitmap_info.bmiHeader.biHeight = -height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 1;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+    bitmap_info.bmiColors[0].rgbBlue = 0;
+    bitmap_info.bmiColors[0].rgbGreen = 0;
+    bitmap_info.bmiColors[0].rgbRed = 0;
+    bitmap_info.bmiColors[1].rgbBlue = 255;
+    bitmap_info.bmiColors[1].rgbGreen = 255;
+    bitmap_info.bmiColors[1].rgbRed = 255;
+
+    int rows = GetDIBits(
+        dc,
+        bitmap,
+        0,
+        (UINT)height,
+        bits,
+        (BITMAPINFO *)&bitmap_info,
+        DIB_RGB_COLORS);
+
+    DeleteDC(dc);
+
+    if (rows != height) {
+        free(bits);
+        return NULL;
+    }
+
+    *stride_out = stride;
+    return bits;
+}
+
+static bool GetMaskBit(const BYTE *bits, int stride, int x, int y)
+{
+    return (bits[y * stride + x / 8] & (BYTE)(0x80 >> (x % 8))) != 0;
+}
+
+static void BuildCursorFromMonochromeMask(const BYTE *mask_bits, int mask_stride, int mask_height)
+{
+    int xor_offset = mask_height >= g_cursor.height * 2 ? g_cursor.height : 0;
+
+    for (int y = 0; y < g_cursor.height; ++y) {
+        for (int x = 0; x < g_cursor.width; ++x) {
+            bool and_bit = GetMaskBit(mask_bits, mask_stride, x, y);
+            bool xor_bit = xor_offset > 0 ? GetMaskBit(mask_bits, mask_stride, x, y + xor_offset) : false;
+            DWORD pixel = 0;
+
+            if (!and_bit && !xor_bit) {
+                pixel = 0xFF000000;
+            } else if (!and_bit && xor_bit) {
+                pixel = 0xFFFFFFFF;
+            } else if (and_bit && xor_bit) {
+                pixel = 0xFF000000;
+            }
+
+            g_cursor_pixels[y * g_cursor.width + x] = pixel;
+        }
+    }
+}
+
+static bool BuildCursorBitmapPixels(void)
+{
+    ICONINFO icon_info;
+    ZeroMemory(&icon_info, sizeof(icon_info));
+
+    if (!g_cursor.handle || !GetIconInfo(g_cursor.handle, &icon_info)) {
+        return false;
+    }
+
+    bool ok = false;
+    int pixel_count = g_cursor.width * g_cursor.height;
+    ZeroMemory(g_cursor_pixels, (size_t)pixel_count * sizeof(DWORD));
+
+    if (icon_info.hbmColor) {
+        DWORD *color_pixels = (DWORD *)malloc((size_t)pixel_count * sizeof(DWORD));
+        if (color_pixels && ReadBitmap32(icon_info.hbmColor, g_cursor.width, g_cursor.height, color_pixels)) {
+            bool has_alpha = false;
+            for (int i = 0; i < pixel_count; ++i) {
+                if ((color_pixels[i] >> 24) != 0) {
+                    has_alpha = true;
+                    break;
+                }
+            }
+
+            if (has_alpha) {
+                bool needs_premultiply = BitmapNeedsPremultiply(color_pixels, pixel_count);
+                for (int i = 0; i < pixel_count; ++i) {
+                    DWORD pixel = color_pixels[i];
+                    if ((pixel >> 24) == 0) {
+                        pixel = 0;
+                    } else if (needs_premultiply) {
+                        pixel = PremultiplyPixel(pixel);
+                    }
+                    g_cursor_pixels[i] = pixel;
+                }
+                ok = true;
+            } else {
+                int mask_stride = 0;
+                BYTE *mask_bits = NULL;
+                BITMAP mask_bitmap;
+                ZeroMemory(&mask_bitmap, sizeof(mask_bitmap));
+
+                if (icon_info.hbmMask &&
+                    GetObjectW(icon_info.hbmMask, sizeof(mask_bitmap), &mask_bitmap) == sizeof(mask_bitmap)) {
+                    mask_bits = ReadMonoMaskBits(
+                        icon_info.hbmMask,
+                        mask_bitmap.bmWidth,
+                        mask_bitmap.bmHeight,
+                        &mask_stride);
+                }
+
+                for (int y = 0; y < g_cursor.height; ++y) {
+                    for (int x = 0; x < g_cursor.width; ++x) {
+                        int i = y * g_cursor.width + x;
+                        bool transparent = false;
+                        if (mask_bits && x < mask_bitmap.bmWidth && y < mask_bitmap.bmHeight) {
+                            transparent = GetMaskBit(mask_bits, mask_stride, x, y);
+                        }
+
+                        if (!transparent) {
+                            g_cursor_pixels[i] = color_pixels[i] | 0xFF000000;
+                        }
+                    }
+                }
+
+                if (mask_bits) {
+                    free(mask_bits);
+                }
+                ok = true;
+            }
+        }
+
+        if (color_pixels) {
+            free(color_pixels);
+        }
+    } else if (icon_info.hbmMask) {
+        BITMAP mask_bitmap;
+        ZeroMemory(&mask_bitmap, sizeof(mask_bitmap));
+        if (GetObjectW(icon_info.hbmMask, sizeof(mask_bitmap), &mask_bitmap) == sizeof(mask_bitmap)) {
+            int mask_stride = 0;
+            BYTE *mask_bits = ReadMonoMaskBits(
+                icon_info.hbmMask,
+                mask_bitmap.bmWidth,
+                mask_bitmap.bmHeight,
+                &mask_stride);
+
+            if (mask_bits) {
+                BuildCursorFromMonochromeMask(mask_bits, mask_stride, mask_bitmap.bmHeight);
+                free(mask_bits);
+                ok = true;
+            }
+        }
+    }
+
+    DeleteIconInfoBitmaps(&icon_info);
+    return ok;
+}
+
+static void CopyCursorToCanvas(int image_x, int image_y)
+{
+    int src_x = 0;
+    int src_y = 0;
+    int copy_w = g_cursor_bitmap_w;
+    int copy_h = g_cursor_bitmap_h;
+
+    if (image_x < 0) {
+        src_x = -image_x;
+        copy_w -= src_x;
+        image_x = 0;
+    }
+    if (image_y < 0) {
+        src_y = -image_y;
+        copy_h -= src_y;
+        image_y = 0;
+    }
+    if (image_x + copy_w > g_canvas_w) {
+        copy_w = g_canvas_w - image_x;
+    }
+    if (image_y + copy_h > g_canvas_h) {
+        copy_h = g_canvas_h - image_y;
+    }
+    if (copy_w <= 0 || copy_h <= 0) {
+        return;
+    }
+
+    for (int y = 0; y < copy_h; ++y) {
+        DWORD *dst = g_canvas_pixels + (image_y + y) * g_canvas_w + image_x;
+        DWORD *src = g_cursor_pixels + (src_y + y) * g_cursor_bitmap_w + src_x;
+        CopyMemory(dst, src, (SIZE_T)copy_w * sizeof(DWORD));
+    }
+}
+
 static void ReleaseCanvasResources(void)
 {
     if (g_canvas_dc && g_canvas_old_bitmap) {
@@ -434,6 +726,7 @@ static void ReleaseCanvasResources(void)
     }
 
     g_canvas_old_bitmap = NULL;
+    g_canvas_pixels = NULL;
     g_canvas_w = 0;
     g_canvas_h = 0;
     g_have_rendered_cursor = false;
@@ -456,6 +749,7 @@ static void ReleaseCursorBitmapResources(void)
     }
 
     g_cursor_old_bitmap = NULL;
+    g_cursor_pixels = NULL;
     g_cursor_bitmap_w = 0;
     g_cursor_bitmap_h = 0;
 }
@@ -493,11 +787,11 @@ static bool EnsureCursorBitmapResources(void)
         g_cursor_dc,
         &bitmap_info,
         DIB_RGB_COLORS,
-        NULL,
+        (void **)&g_cursor_pixels,
         NULL,
         0);
 
-    if (!g_cursor_bitmap) {
+    if (!g_cursor_bitmap || !g_cursor_pixels) {
         ReleaseCursorBitmapResources();
         return false;
     }
@@ -508,21 +802,10 @@ static bool EnsureCursorBitmapResources(void)
         return false;
     }
 
-    RECT rect = {0, 0, g_cursor.width, g_cursor.height};
-    HBRUSH brush = CreateSolidBrush(TRANSPARENT_COLOR);
-    FillRect(g_cursor_dc, &rect, brush);
-    DeleteObject(brush);
-
-    DrawIconEx(
-        g_cursor_dc,
-        0,
-        0,
-        g_cursor.handle,
-        g_cursor.width,
-        g_cursor.height,
-        0,
-        NULL,
-        DI_NORMAL);
+    if (!BuildCursorBitmapPixels()) {
+        ReleaseCursorBitmapResources();
+        return false;
+    }
 
     g_cursor_bitmap_w = g_cursor.width;
     g_cursor_bitmap_h = g_cursor.height;
@@ -555,11 +838,11 @@ static bool EnsureCanvasResources(int width, int height)
         g_canvas_dc,
         &bitmap_info,
         DIB_RGB_COLORS,
-        NULL,
+        (void **)&g_canvas_pixels,
         NULL,
         0);
 
-    if (!g_canvas_bitmap) {
+    if (!g_canvas_bitmap || !g_canvas_pixels) {
         ReleaseCanvasResources();
         return false;
     }
@@ -644,26 +927,14 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     }
 
     LARGE_INTEGER step_start = ProfileNow();
-    RECT rect = {0, 0, g_canvas_w, g_canvas_h};
-    HBRUSH brush = CreateSolidBrush(TRANSPARENT_COLOR);
-    FillRect(g_canvas_dc, &rect, brush);
-    DeleteObject(brush);
+    ZeroMemory(g_canvas_pixels, (size_t)g_canvas_w * (size_t)g_canvas_h * sizeof(DWORD));
     ProfileAddDuration(&g_profile.fill_canvas, step_start, ProfileNow());
 
     int image_x = cursor_pos.x - g_cursor.hotspot_x - g_canvas_x;
     int image_y = cursor_pos.y - g_cursor.hotspot_y - g_canvas_y;
 
     step_start = ProfileNow();
-    BitBlt(
-        g_canvas_dc,
-        image_x,
-        image_y,
-        g_cursor.width,
-        g_cursor.height,
-        g_cursor_dc,
-        0,
-        0,
-        SRCCOPY);
+    CopyCursorToCanvas(image_x, image_y);
     ProfileAddDuration(&g_profile.draw_icon, step_start, ProfileNow());
 
     step_start = ProfileNow();
@@ -678,6 +949,12 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     POINT dst = {g_canvas_x, g_canvas_y};
     POINT src = {0, 0};
     SIZE size = {g_canvas_w, g_canvas_h};
+    BLENDFUNCTION blend;
+    ZeroMemory(&blend, sizeof(blend));
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+
     step_start = ProfileNow();
     BOOL ok = UpdateLayeredWindow(
         g_overlay_hwnd,
@@ -686,9 +963,9 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         &size,
         g_canvas_dc,
         &src,
-        TRANSPARENT_COLOR,
-        NULL,
-        ULW_COLORKEY);
+        0,
+        &blend,
+        ULW_ALPHA);
     ProfileAddDuration(&g_profile.update_layered, step_start, ProfileNow());
 
     ReleaseDC(NULL, screen_dc);
