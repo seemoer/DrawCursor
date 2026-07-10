@@ -20,9 +20,8 @@
 
 #define WM_TRAYICON (WM_APP + 1)
 #define TIMER_CURSOR 1
-#define TIMER_RENDER 2
 #define TIMER_INTERVAL_MS 50
-#define RENDER_INTERVAL_MS 8
+#define RENDER_INTERVAL_MS 4
 #define MOTION_IDLE_MS 20
 #define CURSOR_CANVAS_SIZE 384
 #define CURSOR_CANVAS_MARGIN 32
@@ -33,10 +32,19 @@
 
 #define TRAY_ICON_ID 1
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 typedef HANDLE DPI_AWARENESS_CONTEXT;
 typedef BOOL(WINAPI *SetProcessDpiAwarenessContextFn)(DPI_AWARENESS_CONTEXT);
 typedef BOOL(WINAPI *SetProcessDpiAwareFn)(void);
 typedef UINT(WINAPI *TimePeriodFn)(UINT);
+typedef HANDLE(WINAPI *CreateWaitableTimerExFn)(
+    LPSECURITY_ATTRIBUTES,
+    LPCWSTR,
+    DWORD,
+    DWORD);
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
@@ -103,6 +111,7 @@ static bool g_redraw_enabled = true;
 static bool g_overlay_visible = false;
 static bool g_cursor_showing = false;
 static bool g_render_timer_active = false;
+static HANDLE g_render_timer;
 static DWORD g_last_input_tick = 0;
 static CursorMetrics g_cursor;
 static HMODULE g_winmm;
@@ -1153,20 +1162,54 @@ static void RenderCursorAtCurrentPosition(bool force_update)
 
 static void StopRenderTimer(void)
 {
-    if (g_render_timer_active && g_main_hwnd) {
-        KillTimer(g_main_hwnd, TIMER_RENDER);
+    if (g_render_timer_active && g_render_timer) {
+        CancelWaitableTimer(g_render_timer);
         PROFILE_INC(g_profile.timer_stopped);
     }
 
     g_render_timer_active = false;
 }
 
+static bool ArmRenderTimer(DWORD delay_ms)
+{
+    if (!g_render_timer) {
+        return false;
+    }
+
+    LARGE_INTEGER due_time;
+    due_time.QuadPart = -(LONGLONG)delay_ms * 10000LL;
+    if (!SetWaitableTimer(g_render_timer, &due_time, 0, NULL, NULL, FALSE)) {
+        g_render_timer_active = false;
+        return false;
+    }
+
+    if (!g_render_timer_active) {
+        PROFILE_INC(g_profile.timer_started);
+    }
+    g_render_timer_active = true;
+    return true;
+}
+
 static void StartRenderTimer(void)
 {
-    if (!g_render_timer_active && g_main_hwnd) {
-        SetTimer(g_main_hwnd, TIMER_RENDER, RENDER_INTERVAL_MS, NULL);
-        g_render_timer_active = true;
-        PROFILE_INC(g_profile.timer_started);
+    if (!g_render_timer_active) {
+        ArmRenderTimer(RENDER_INTERVAL_MS);
+    }
+}
+
+static void ProcessRenderTimer(void)
+{
+    if (!g_render_timer_active) {
+        return;
+    }
+
+    PROFILE_INC(g_profile.render_timer_ticks);
+    RenderCursorAtCurrentPosition(false);
+
+    if (g_redraw_enabled && GetTickCount() - g_last_input_tick <= MOTION_IDLE_MS) {
+        ArmRenderTimer(RENDER_INTERVAL_MS);
+    } else {
+        StopRenderTimer();
     }
 }
 
@@ -1409,16 +1452,6 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
             ProfileQueueSnapshot(false);
             return 0;
         }
-        if (wparam == TIMER_RENDER) {
-            PROFILE_INC(g_profile.render_timer_ticks);
-            if (g_redraw_enabled && GetTickCount() - g_last_input_tick <= MOTION_IDLE_MS) {
-                RenderCursorAtCurrentPosition(false);
-            } else {
-                RenderCursorAtCurrentPosition(false);
-                StopRenderTimer();
-            }
-            return 0;
-        }
         break;
 
     case WM_COMMAND:
@@ -1487,6 +1520,30 @@ static bool RegisterWindowClasses(void)
     return RegisterClassExW(&overlay_class) != 0;
 }
 
+static bool CreateRenderTimer(void)
+{
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (kernel32) {
+        union {
+            FARPROC proc;
+            CreateWaitableTimerExFn fn;
+        } timer_api;
+        timer_api.proc = GetProcAddress(kernel32, "CreateWaitableTimerExW");
+        if (timer_api.fn) {
+            g_render_timer = timer_api.fn(
+                NULL,
+                NULL,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS);
+        }
+    }
+
+    if (!g_render_timer) {
+        g_render_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    }
+    return g_render_timer != NULL;
+}
+
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR command_line, int show_command)
 {
     (void)previous_instance;
@@ -1509,8 +1566,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
     BeginTimerPrecision();
     ProfileInit();
 
-    if (!RegisterWindowClasses()) {
+    if (!CreateRenderTimer() || !RegisterWindowClasses()) {
         MessageBoxW(NULL, L"窗口类注册失败。", APP_NAME, MB_OK | MB_ICONERROR);
+        if (g_render_timer) {
+            CloseHandle(g_render_timer);
+            g_render_timer = NULL;
+        }
         ProfileClose();
         EndTimerPrecision();
         CloseHandle(mutex);
@@ -1534,17 +1595,44 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
     if (!hwnd) {
         MessageBoxW(NULL, L"DrawCursor 启动失败。", APP_NAME, MB_OK | MB_ICONERROR);
         ProfileClose();
+        CloseHandle(g_render_timer);
+        g_render_timer = NULL;
         EndTimerPrecision();
         CloseHandle(mutex);
         return 1;
     }
 
     MSG message;
-    while (GetMessageW(&message, NULL, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+    ZeroMemory(&message, sizeof(message));
+    bool running = true;
+    while (running) {
+        DWORD wait_result = MsgWaitForMultipleObjectsEx(
+            1,
+            &g_render_timer,
+            INFINITE,
+            QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE);
+
+        if (wait_result == WAIT_OBJECT_0) {
+            ProcessRenderTimer();
+            continue;
+        }
+        if (wait_result != WAIT_OBJECT_0 + 1) {
+            break;
+        }
+
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
 
+    CloseHandle(g_render_timer);
+    g_render_timer = NULL;
     ProfileClose();
     EndTimerPrecision();
     CloseHandle(mutex);
