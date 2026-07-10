@@ -76,7 +76,6 @@ typedef struct ProfileStats {
     DurationStats get_cursor_pos;
     DurationStats fill_canvas;
     DurationStats draw_icon;
-    DurationStats get_screen_dc;
     DurationStats update_layered;
     DurationStats render_total;
     DurationStats input_to_render;
@@ -294,7 +293,6 @@ static void ProfileTakeStats(ProfileStats *snapshot)
     ProfileTakeDuration(&g_profile.get_cursor_pos, &snapshot->get_cursor_pos);
     ProfileTakeDuration(&g_profile.fill_canvas, &snapshot->fill_canvas);
     ProfileTakeDuration(&g_profile.draw_icon, &snapshot->draw_icon);
-    ProfileTakeDuration(&g_profile.get_screen_dc, &snapshot->get_screen_dc);
     ProfileTakeDuration(&g_profile.update_layered, &snapshot->update_layered);
     ProfileTakeDuration(&g_profile.render_total, &snapshot->render_total);
     ProfileTakeDuration(&g_profile.input_to_render, &snapshot->input_to_render);
@@ -308,7 +306,7 @@ static void ProfileWriteRow(const ProfileRow *row)
         line,
         sizeof(line),
         "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
-        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
+        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
         row->since_start_ms,
         row->interval_ms,
         (ULONGLONG)stats->input_events,
@@ -333,8 +331,6 @@ static void ProfileWriteRow(const ProfileRow *row)
         (ULONGLONG)stats->fill_canvas.max_us,
         ProfileAvgUs(stats->draw_icon),
         (ULONGLONG)stats->draw_icon.max_us,
-        ProfileAvgUs(stats->get_screen_dc),
-        (ULONGLONG)stats->get_screen_dc.max_us,
         ProfileAvgUs(stats->update_layered),
         (ULONGLONG)stats->update_layered.max_us,
         ProfileAvgUs(stats->render_total),
@@ -439,7 +435,7 @@ static void ProfileInit(void)
         "render_attempts,render_success,render_fail,render_noop_same_pos,render_force,canvas_recenter,"
         "canvas_recreated,cursor_changed,cursor_hidden,timer_started,timer_stopped,overlay_shown,"
         "getcursor_avg_us,getcursor_max_us,fill_avg_us,fill_max_us,drawicon_avg_us,drawicon_max_us,"
-        "getdc_avg_us,getdc_max_us,update_layered_avg_us,update_layered_max_us,render_total_avg_us,"
+        "update_layered_avg_us,update_layered_max_us,render_total_avg_us,"
         "render_total_max_us,update_layered_calls,render_total_calls,input_to_render_avg_us,"
         "input_to_render_max_us\n");
 
@@ -1087,15 +1083,6 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     CopyCursorToCanvas(image_x, image_y);
     ProfileAddDuration(&g_profile.draw_icon, step_start, ProfileNow());
 
-    step_start = ProfileNow();
-    HDC screen_dc = GetDC(NULL);
-    ProfileAddDuration(&g_profile.get_screen_dc, step_start, ProfileNow());
-    if (!screen_dc) {
-        PROFILE_INC(g_profile.render_fail);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
-        return false;
-    }
-
     POINT dst = {g_canvas_x, g_canvas_y};
     POINT src = {0, 0};
     SIZE size = {g_canvas_w, g_canvas_h};
@@ -1108,7 +1095,7 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     step_start = ProfileNow();
     BOOL ok = UpdateLayeredWindow(
         g_overlay_hwnd,
-        screen_dc,
+        NULL,
         &dst,
         &size,
         g_canvas_dc,
@@ -1117,8 +1104,6 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         &blend,
         ULW_ALPHA);
     ProfileAddDuration(&g_profile.update_layered, step_start, ProfileNow());
-
-    ReleaseDC(NULL, screen_dc);
 
     if (!ok) {
         PROFILE_INC(g_profile.render_fail);
