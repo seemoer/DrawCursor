@@ -42,50 +42,64 @@ if ([DrawCursorVerifyNative]::FindWindow($ClassName, $WindowName) -ne [IntPtr]::
     throw "DrawCursor is already running; close it before verification"
 }
 
-$Process = Start-Process -FilePath $Executable -PassThru -WindowStyle Hidden
+$ProfileBackup = "$Profile.verify-backup-$PID"
+$HadExistingProfile = Test-Path -LiteralPath $Profile
+if ($HadExistingProfile) {
+    Move-Item -LiteralPath $Profile -Destination $ProfileBackup
+}
+
 try {
-    $Window = [IntPtr]::Zero
-    for ($attempt = 0; $attempt -lt 30; ++$attempt) {
-        Start-Sleep -Milliseconds 50
-        $Window = [DrawCursorVerifyNative]::FindWindow($ClassName, $WindowName)
-        if ($Window -ne [IntPtr]::Zero) {
-            break
+    $Process = Start-Process -FilePath $Executable -PassThru -WindowStyle Hidden
+    try {
+        $Window = [IntPtr]::Zero
+        for ($attempt = 0; $attempt -lt 30; ++$attempt) {
+            Start-Sleep -Milliseconds 50
+            $Window = [DrawCursorVerifyNative]::FindWindow($ClassName, $WindowName)
+            if ($Window -ne [IntPtr]::Zero) {
+                break
+            }
+        }
+        if ($Window -eq [IntPtr]::Zero) {
+            throw "DrawCursor did not create its main window"
+        }
+
+        Start-Sleep -Milliseconds 150
+        [void][DrawCursorVerifyNative]::PostMessage(
+            $Window,
+            0x0010,
+            [IntPtr]::Zero,
+            [IntPtr]::Zero)
+        if (-not $Process.WaitForExit(5000)) {
+            throw "DrawCursor did not exit within five seconds"
         }
     }
-    if ($Window -eq [IntPtr]::Zero) {
-        throw "DrawCursor did not create its main window"
+    finally {
+        if (-not $Process.HasExited) {
+            Stop-Process -Id $Process.Id -Force
+        }
     }
 
-    Start-Sleep -Milliseconds 150
-    [void][DrawCursorVerifyNative]::PostMessage(
-        $Window,
-        0x0010,
-        [IntPtr]::Zero,
-        [IntPtr]::Zero)
-    if (-not $Process.WaitForExit(5000)) {
-        throw "DrawCursor did not exit within five seconds"
+    $Lines = @(Get-Content -LiteralPath $Profile)
+    if ($Lines.Count -lt 2) {
+        throw "profiling CSV does not contain a header and data row"
+    }
+
+    $HeaderColumns = $Lines[0].Split(',').Count
+    if ($HeaderColumns -ne $ExpectedColumns) {
+        throw "profiling header has $HeaderColumns columns; expected $ExpectedColumns"
+    }
+
+    for ($index = 1; $index -lt $Lines.Count; ++$index) {
+        $DataColumns = $Lines[$index].Split(',').Count
+        if ($DataColumns -ne $ExpectedColumns) {
+            throw "profiling row $index has $DataColumns columns; expected $ExpectedColumns"
+        }
     }
 }
 finally {
-    if (-not $Process.HasExited) {
-        Stop-Process -Id $Process.Id -Force
-    }
-}
-
-$Lines = @(Get-Content -LiteralPath $Profile)
-if ($Lines.Count -lt 2) {
-    throw "profiling CSV does not contain a header and data row"
-}
-
-$HeaderColumns = $Lines[0].Split(',').Count
-if ($HeaderColumns -ne $ExpectedColumns) {
-    throw "profiling header has $HeaderColumns columns; expected $ExpectedColumns"
-}
-
-for ($index = 1; $index -lt $Lines.Count; ++$index) {
-    $DataColumns = $Lines[$index].Split(',').Count
-    if ($DataColumns -ne $ExpectedColumns) {
-        throw "profiling row $index has $DataColumns columns; expected $ExpectedColumns"
+    if ($HadExistingProfile -and (Test-Path -LiteralPath $ProfileBackup)) {
+        Remove-Item -LiteralPath $Profile -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $ProfileBackup -Destination $Profile
     }
 }
 
