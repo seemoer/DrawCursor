@@ -88,6 +88,10 @@ typedef struct ProfileStats {
     volatile LONG64 overlay_shown;
     volatile LONG64 dwm_timing_success;
     volatile LONG64 dwm_timing_fail;
+    volatile LONG64 input_batches;
+    volatile LONG64 input_buffered_events;
+    volatile LONG64 input_coalesced;
+    volatile LONG64 input_buffer_failures;
     DurationStats get_cursor_info;
     DurationStats fill_canvas;
     DurationStats draw_icon;
@@ -106,6 +110,7 @@ typedef struct ProfileRow {
 
 #define PROFILE_QUEUE_CAPACITY 16
 #define PROFILE_INC(field) InterlockedIncrement64(&(field))
+#define PROFILE_ADD(field, value) InterlockedAdd64(&(field), (LONG64)(value))
 
 typedef struct BitmapInfo1bpp {
     BITMAPINFOHEADER bmiHeader;
@@ -177,6 +182,9 @@ static LONG64 g_render_timer_deadline_qpc = 0;
 static LONG64 g_render_cadence_deadline_qpc = 0;
 static ULONGLONG g_submit_cost_ewma_us = 750;
 static HMONITOR g_last_cursor_monitor;
+static BYTE *g_raw_input_buffer;
+static UINT g_raw_input_buffer_size = 0;
+static bool g_raw_input_buffer_disabled = false;
 
 static void ReleaseCursorBitmapResources(void);
 
@@ -338,6 +346,10 @@ static void ProfileTakeStats(ProfileStats *snapshot)
     PROFILE_TAKE_COUNTER(overlay_shown);
     PROFILE_TAKE_COUNTER(dwm_timing_success);
     PROFILE_TAKE_COUNTER(dwm_timing_fail);
+    PROFILE_TAKE_COUNTER(input_batches);
+    PROFILE_TAKE_COUNTER(input_buffered_events);
+    PROFILE_TAKE_COUNTER(input_coalesced);
+    PROFILE_TAKE_COUNTER(input_buffer_failures);
 #undef PROFILE_TAKE_COUNTER
 
     ProfileTakeDuration(&g_profile.get_cursor_info, &snapshot->get_cursor_info);
@@ -359,7 +371,7 @@ static void ProfileWriteRow(const ProfileRow *row)
         sizeof(line),
         "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
         "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
-        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
+        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
         row->since_start_ms,
         row->interval_ms,
         (ULONGLONG)stats->input_events,
@@ -397,7 +409,11 @@ static void ProfileWriteRow(const ProfileRow *row)
         ProfileAvgUs(stats->refresh_period),
         (ULONGLONG)stats->refresh_period.max_us,
         ProfileAvgUs(stats->deadline_late),
-        (ULONGLONG)stats->deadline_late.max_us);
+        (ULONGLONG)stats->deadline_late.max_us,
+        (ULONGLONG)stats->input_batches,
+        (ULONGLONG)stats->input_buffered_events,
+        (ULONGLONG)stats->input_coalesced,
+        (ULONGLONG)stats->input_buffer_failures);
 
     if (len > 0) {
         ProfileWrite(line);
@@ -497,7 +513,8 @@ static void ProfileInit(void)
         "update_layered_avg_us,update_layered_max_us,render_total_avg_us,"
         "render_total_max_us,update_layered_calls,render_total_calls,input_to_render_avg_us,"
         "input_to_render_max_us,dwm_timing_success,dwm_timing_fail,refresh_period_avg_us,"
-        "refresh_period_max_us,deadline_late_avg_us,deadline_late_max_us\n");
+        "refresh_period_max_us,deadline_late_avg_us,deadline_late_max_us,input_batches,"
+        "input_buffered_events,input_coalesced,input_buffer_failures\n");
 
     InitializeCriticalSection(&g_profile_queue_lock);
     g_profile_queue_lock_ready = true;
@@ -1555,6 +1572,151 @@ static void RequestCursorStateSync(void)
     }
 }
 
+static bool ResizeRawInputBuffer(UINT required_size)
+{
+    const UINT default_size = 64 * 1024;
+    UINT new_size = required_size > default_size ? required_size : default_size;
+    new_size = (new_size + 7U) & ~7U;
+
+    BYTE *new_buffer = (BYTE *)realloc(g_raw_input_buffer, new_size);
+    if (!new_buffer) {
+        return false;
+    }
+    g_raw_input_buffer = new_buffer;
+    g_raw_input_buffer_size = new_size;
+    return true;
+}
+
+static void InitRawInputBuffer(void)
+{
+    WCHAR disabled[2];
+    g_raw_input_buffer_disabled = GetEnvironmentVariableW(
+        L"DRAWCURSOR_DISABLE_RAW_INPUT_BUFFER",
+        disabled,
+        ARRAYSIZE(disabled)) > 0;
+    if (!g_raw_input_buffer_disabled) {
+        ResizeRawInputBuffer(0);
+    }
+}
+
+static void ReleaseRawInputBuffer(void)
+{
+    free(g_raw_input_buffer);
+    g_raw_input_buffer = NULL;
+    g_raw_input_buffer_size = 0;
+    g_raw_input_buffer_disabled = false;
+}
+
+static bool ReadCurrentRawMouse(HRAWINPUT input_handle, bool *is_mouse)
+{
+    RAWINPUT input;
+    UINT size = sizeof(input);
+    UINT result = GetRawInputData(
+        input_handle,
+        RID_INPUT,
+        &input,
+        &size,
+        sizeof(RAWINPUTHEADER));
+    if (result == (UINT)-1 || result < sizeof(RAWINPUTHEADER)) {
+        return false;
+    }
+
+    *is_mouse = input.header.dwType == RIM_TYPEMOUSE;
+    return true;
+}
+
+static PRAWINPUT NextRawInputBlockAligned(PRAWINPUT input)
+{
+    ULONG_PTR next = (ULONG_PTR)input + input->header.dwSize;
+    next = (next + sizeof(ULONGLONG) - 1) & ~(ULONG_PTR)(sizeof(ULONGLONG) - 1);
+    return (PRAWINPUT)next;
+}
+
+static UINT DrainBufferedRawMouseInputs(bool *failed)
+{
+    *failed = false;
+    if (g_raw_input_buffer_disabled) {
+        *failed = true;
+        return 0;
+    }
+    if (!g_raw_input_buffer && !ResizeRawInputBuffer(0)) {
+        *failed = true;
+        return 0;
+    }
+
+    UINT mouse_events = 0;
+    for (;;) {
+        UINT buffer_size = g_raw_input_buffer_size;
+        UINT count = GetRawInputBuffer(
+            (PRAWINPUT)g_raw_input_buffer,
+            &buffer_size,
+            sizeof(RAWINPUTHEADER));
+
+        if (count == (UINT)-1) {
+            DWORD error = GetLastError();
+            if (error == ERROR_INSUFFICIENT_BUFFER &&
+                buffer_size > g_raw_input_buffer_size &&
+                ResizeRawInputBuffer(buffer_size)) {
+                continue;
+            }
+            *failed = true;
+            return mouse_events;
+        }
+        if (count == 0) {
+            return mouse_events;
+        }
+
+        PRAWINPUT input = (PRAWINPUT)g_raw_input_buffer;
+        for (UINT i = 0; i < count; ++i) {
+            if (input->header.dwType == RIM_TYPEMOUSE) {
+                ++mouse_events;
+            }
+
+            PRAWINPUT input_for_default = input;
+            DefRawInputProc(&input_for_default, 1, sizeof(RAWINPUTHEADER));
+            input = NextRawInputBlockAligned(input);
+        }
+    }
+}
+
+static LRESULT ProcessRawInputMessage(HWND hwnd, WPARAM wparam, LPARAM lparam)
+{
+    bool current_is_mouse = false;
+    bool current_read = ReadCurrentRawMouse((HRAWINPUT)lparam, &current_is_mouse);
+    if (!current_read) {
+        PROFILE_INC(g_profile.input_buffer_failures);
+        current_is_mouse = true;
+    }
+
+#ifdef DRAWCURSOR_RAW_INPUT_TEST_HOLD_MS
+    Sleep(DRAWCURSOR_RAW_INPUT_TEST_HOLD_MS);
+#endif
+
+    bool buffer_failed = false;
+    UINT buffered_events = DrainBufferedRawMouseInputs(&buffer_failed);
+    if (buffer_failed) {
+        PROFILE_INC(g_profile.input_buffer_failures);
+    }
+
+    UINT total_events = (current_is_mouse ? 1U : 0U) + buffered_events;
+    if (total_events > 0) {
+        PROFILE_ADD(g_profile.input_events, total_events);
+        PROFILE_INC(g_profile.input_batches);
+        PROFILE_ADD(g_profile.input_buffered_events, buffered_events);
+        if (total_events > 1) {
+            PROFILE_ADD(g_profile.input_coalesced, total_events - 1);
+        }
+        if (IsRedrawEnabled()) {
+            RequestCursorRender();
+        }
+    }
+
+    if (GET_RAWINPUT_CODE_WPARAM(wparam) == RIM_INPUT) {
+        return DefWindowProcW(hwnd, WM_INPUT, wparam, lparam);
+    }
+    return 0;
+}
+
 static bool RegisterRawMouseInput(HWND hwnd)
 {
     RAWINPUTDEVICE mouse;
@@ -1709,6 +1871,7 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
     switch (message) {
     case WM_CREATE:
         g_main_hwnd = hwnd;
+        InitRawInputBuffer();
         if (!AddTrayIcon(hwnd) ||
             !RegisterRawMouseInput(hwnd)) {
             DestroyWindow(hwnd);
@@ -1718,11 +1881,7 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
         return 0;
 
     case WM_INPUT:
-        PROFILE_INC(g_profile.input_events);
-        if (IsRedrawEnabled()) {
-            RequestCursorRender();
-        }
-        return DefWindowProcW(hwnd, message, wparam, lparam);
+        return ProcessRawInputMessage(hwnd, wparam, lparam);
 
     case WM_TIMER:
         if (wparam == TIMER_CURSOR) {
@@ -1759,6 +1918,7 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
 
     case WM_DESTROY:
         UnregisterRawMouseInput();
+        ReleaseRawInputBuffer();
         KillTimer(hwnd, TIMER_CURSOR);
         RemoveTrayIcon();
         g_main_hwnd = NULL;
