@@ -45,6 +45,9 @@ typedef HANDLE(WINAPI *CreateWaitableTimerExFn)(
     LPCWSTR,
     DWORD,
     DWORD);
+typedef HANDLE(WINAPI *AvSetMmThreadCharacteristicsFn)(LPCWSTR, LPDWORD);
+typedef BOOL(WINAPI *AvSetMmThreadPriorityFn)(HANDLE, int);
+typedef BOOL(WINAPI *AvRevertMmThreadCharacteristicsFn)(HANDLE);
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
@@ -107,12 +110,20 @@ static HINSTANCE g_instance;
 static HWND g_main_hwnd;
 static HWND g_overlay_hwnd;
 static NOTIFYICONDATAW g_tray;
-static bool g_redraw_enabled = true;
+static volatile LONG g_redraw_enabled = 1;
 static bool g_overlay_visible = false;
 static bool g_cursor_showing = false;
 static bool g_render_timer_active = false;
 static HANDLE g_render_timer;
-static DWORD g_last_input_tick = 0;
+static HANDLE g_render_thread;
+static HANDLE g_render_wake_event;
+static HANDLE g_render_ready_event;
+static volatile LONG g_render_stop = 0;
+static volatile LONG g_render_thread_ready = 0;
+static volatile LONG g_render_requested = 0;
+static volatile LONG g_state_sync_requested = 0;
+static volatile LONG g_force_render_requested = 0;
+static volatile LONG g_last_input_tick = 0;
 static CursorMetrics g_cursor;
 static HMODULE g_winmm;
 static TimePeriodFn g_time_begin_period;
@@ -150,6 +161,11 @@ static ProfileStats g_profile;
 static volatile LONG64 g_latest_input_qpc = 0;
 
 static void ReleaseCursorBitmapResources(void);
+
+static bool IsRedrawEnabled(void)
+{
+    return InterlockedCompareExchange(&g_redraw_enabled, 0, 0) != 0;
+}
 
 static void SetLatencyPriority(void)
 {
@@ -1046,7 +1062,7 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         PROFILE_INC(g_profile.render_force);
     }
 
-    if (!g_redraw_enabled || !g_overlay_hwnd || !g_cursor_showing || !g_cursor.handle) {
+    if (!IsRedrawEnabled() || !g_overlay_hwnd || !g_cursor_showing || !g_cursor.handle) {
         PROFILE_INC(g_profile.render_fail);
         ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return false;
@@ -1206,7 +1222,8 @@ static void ProcessRenderTimer(void)
     PROFILE_INC(g_profile.render_timer_ticks);
     RenderCursorAtCurrentPosition(false);
 
-    if (g_redraw_enabled && GetTickCount() - g_last_input_tick <= MOTION_IDLE_MS) {
+    DWORD last_input_tick = (DWORD)InterlockedCompareExchange(&g_last_input_tick, 0, 0);
+    if (IsRedrawEnabled() && GetTickCount() - last_input_tick <= MOTION_IDLE_MS) {
         ArmRenderTimer(RENDER_INTERVAL_MS);
     } else {
         StopRenderTimer();
@@ -1215,24 +1232,28 @@ static void ProcessRenderTimer(void)
 
 static void RequestCursorRender(void)
 {
-    if (!g_main_hwnd) {
-        return;
-    }
-
     PROFILE_INC(g_profile.render_requests);
     LARGE_INTEGER input_time = ProfileNow();
     InterlockedExchange64(&g_latest_input_qpc, input_time.QuadPart);
-    g_last_input_tick = GetTickCount();
+    InterlockedExchange(&g_last_input_tick, (LONG)GetTickCount());
+    InterlockedExchange(&g_render_requested, 1);
 
-    if (!g_render_timer_active) {
-        RenderCursorAtCurrentPosition(false);
-        StartRenderTimer();
+    if (g_render_wake_event) {
+        SetEvent(g_render_wake_event);
+    }
+}
+
+static void RequestCursorStateSync(void)
+{
+    InterlockedExchange(&g_state_sync_requested, 1);
+    if (g_render_wake_event) {
+        SetEvent(g_render_wake_event);
     }
 }
 
 static void SyncCursorState(void)
 {
-    if (!g_redraw_enabled || !g_overlay_hwnd) {
+    if (!IsRedrawEnabled() || !g_overlay_hwnd) {
         g_cursor_showing = false;
         g_have_rendered_cursor = false;
         StopRenderTimer();
@@ -1305,7 +1326,7 @@ static void UpdateTrayIconTip(void)
     g_tray.uFlags = NIF_TIP;
     lstrcpynW(
         g_tray.szTip,
-        g_redraw_enabled ? L"DrawCursor - 重绘已打开" : L"DrawCursor - 重绘已关闭",
+        IsRedrawEnabled() ? L"DrawCursor - 重绘已打开" : L"DrawCursor - 重绘已关闭",
         ARRAYSIZE(g_tray.szTip));
 
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
@@ -1348,8 +1369,8 @@ static void ShowTrayMenu(HWND hwnd)
         return;
     }
 
-    AppendMenuW(menu, MF_STRING, IDM_ENABLE, g_redraw_enabled ? L"打开重绘  \x2022" : L"打开重绘");
-    AppendMenuW(menu, MF_STRING, IDM_DISABLE, g_redraw_enabled ? L"关闭重绘" : L"关闭重绘  \x2022");
+    AppendMenuW(menu, MF_STRING, IDM_ENABLE, IsRedrawEnabled() ? L"打开重绘  \x2022" : L"打开重绘");
+    AppendMenuW(menu, MF_STRING, IDM_DISABLE, IsRedrawEnabled() ? L"关闭重绘" : L"关闭重绘  \x2022");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"关闭 DrawCursor");
 
@@ -1362,19 +1383,13 @@ static void ShowTrayMenu(HWND hwnd)
 
 static void SetRedrawEnabled(bool enabled)
 {
-    if (g_redraw_enabled == enabled) {
+    LONG enabled_value = enabled ? 1 : 0;
+    if (InterlockedExchange(&g_redraw_enabled, enabled_value) == enabled_value) {
         return;
     }
 
-    g_redraw_enabled = enabled;
-    if (!enabled) {
-        g_cursor_showing = false;
-        g_have_rendered_cursor = false;
-        StopRenderTimer();
-        SetOverlayVisible(false);
-    } else {
-        SyncCursorState();
-    }
+    InterlockedExchange(&g_force_render_requested, enabled_value);
+    RequestCursorStateSync();
     UpdateTrayIconTip();
 }
 
@@ -1428,19 +1443,17 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
     switch (message) {
     case WM_CREATE:
         g_main_hwnd = hwnd;
-        if (!CreateOverlayWindow() ||
-            !AddTrayIcon(hwnd) ||
+        if (!AddTrayIcon(hwnd) ||
             !RegisterRawMouseInput(hwnd)) {
             DestroyWindow(hwnd);
             return -1;
         }
         SetTimer(hwnd, TIMER_CURSOR, TIMER_INTERVAL_MS, NULL);
-        SyncCursorState();
         return 0;
 
     case WM_INPUT:
         PROFILE_INC(g_profile.input_events);
-        if (g_redraw_enabled) {
+        if (IsRedrawEnabled()) {
             RequestCursorRender();
         }
         return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -1448,7 +1461,7 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
     case WM_TIMER:
         if (wparam == TIMER_CURSOR) {
             PROFILE_INC(g_profile.state_timer_ticks);
-            SyncCursorState();
+            RequestCursorStateSync();
             ProfileQueueSnapshot(false);
             return 0;
         }
@@ -1477,15 +1490,9 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
 
     case WM_DESTROY:
         UnregisterRawMouseInput();
-        StopRenderTimer();
         KillTimer(hwnd, TIMER_CURSOR);
         RemoveTrayIcon();
-        if (g_overlay_hwnd) {
-            DestroyWindow(g_overlay_hwnd);
-            g_overlay_hwnd = NULL;
-        }
-        ReleaseCanvasResources();
-        ReleaseCursorBitmapResources();
+        g_main_hwnd = NULL;
         PostQuitMessage(0);
         return 0;
     }
@@ -1544,6 +1551,192 @@ static bool CreateRenderTimer(void)
     return g_render_timer != NULL;
 }
 
+typedef struct RenderMmcssState {
+    HMODULE module;
+    HANDLE task;
+    AvRevertMmThreadCharacteristicsFn revert;
+} RenderMmcssState;
+
+static RenderMmcssState BeginRenderMmcss(void)
+{
+    RenderMmcssState state;
+    ZeroMemory(&state, sizeof(state));
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    state.module = LoadLibraryW(L"avrt.dll");
+    if (!state.module) {
+        return state;
+    }
+
+    union {
+        FARPROC proc;
+        AvSetMmThreadCharacteristicsFn characteristics;
+        AvSetMmThreadPriorityFn priority;
+        AvRevertMmThreadCharacteristicsFn revert;
+    } avrt;
+
+    avrt.proc = GetProcAddress(state.module, "AvSetMmThreadCharacteristicsW");
+    AvSetMmThreadCharacteristicsFn set_characteristics = avrt.characteristics;
+    avrt.proc = GetProcAddress(state.module, "AvSetMmThreadPriority");
+    AvSetMmThreadPriorityFn set_priority = avrt.priority;
+    avrt.proc = GetProcAddress(state.module, "AvRevertMmThreadCharacteristics");
+    state.revert = avrt.revert;
+
+    if (set_characteristics) {
+        DWORD task_index = 0;
+        state.task = set_characteristics(L"Capture", &task_index);
+        if (state.task && set_priority) {
+            set_priority(state.task, 1);
+        }
+    }
+
+    return state;
+}
+
+static void EndRenderMmcss(RenderMmcssState *state)
+{
+    if (state->task && state->revert) {
+        state->revert(state->task);
+    }
+    if (state->module) {
+        FreeLibrary(state->module);
+    }
+    ZeroMemory(state, sizeof(*state));
+}
+
+static void ProcessRenderWake(void)
+{
+    bool state_sync = InterlockedExchange(&g_state_sync_requested, 0) != 0;
+    bool render_requested = InterlockedExchange(&g_render_requested, 0) != 0;
+    bool force_render = InterlockedExchange(&g_force_render_requested, 0) != 0;
+
+    if (state_sync) {
+        SyncCursorState();
+    }
+
+    if (render_requested && IsRedrawEnabled()) {
+        if (!g_render_timer_active || force_render) {
+            RenderCursorAtCurrentPosition(force_render);
+            StartRenderTimer();
+        }
+    }
+}
+
+static DWORD WINAPI RenderThreadMain(void *parameter)
+{
+    (void)parameter;
+    RenderMmcssState mmcss = BeginRenderMmcss();
+
+    bool initialized = CreateRenderTimer() && CreateOverlayWindow();
+    InterlockedExchange(&g_render_thread_ready, initialized ? 1 : -1);
+    SetEvent(g_render_ready_event);
+
+    if (!initialized) {
+        if (g_overlay_hwnd) {
+            DestroyWindow(g_overlay_hwnd);
+            g_overlay_hwnd = NULL;
+        }
+        if (g_render_timer) {
+            CloseHandle(g_render_timer);
+            g_render_timer = NULL;
+        }
+        EndRenderMmcss(&mmcss);
+        return 1;
+    }
+
+    HANDLE wait_handles[2] = {g_render_timer, g_render_wake_event};
+    bool running = true;
+    while (running) {
+        DWORD wait_result = MsgWaitForMultipleObjectsEx(
+            ARRAYSIZE(wait_handles),
+            wait_handles,
+            INFINITE,
+            QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE);
+
+        if (InterlockedCompareExchange(&g_render_stop, 0, 0)) {
+            break;
+        }
+        if (wait_result == WAIT_OBJECT_0) {
+            ProcessRenderTimer();
+            continue;
+        }
+        if (wait_result == WAIT_OBJECT_0 + 1) {
+            ProcessRenderWake();
+            continue;
+        }
+        if (wait_result != WAIT_OBJECT_0 + ARRAYSIZE(wait_handles)) {
+            break;
+        }
+
+        MSG message;
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    StopRenderTimer();
+    SetOverlayVisible(false);
+    if (g_overlay_hwnd) {
+        DestroyWindow(g_overlay_hwnd);
+        g_overlay_hwnd = NULL;
+    }
+    ReleaseCanvasResources();
+    ReleaseCursorBitmapResources();
+    CloseHandle(g_render_timer);
+    g_render_timer = NULL;
+    EndRenderMmcss(&mmcss);
+    return 0;
+}
+
+static bool StartRenderThread(void)
+{
+    InterlockedExchange(&g_render_stop, 0);
+    InterlockedExchange(&g_render_thread_ready, 0);
+    g_render_wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_render_ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_render_wake_event || !g_render_ready_event) {
+        return false;
+    }
+
+    g_render_thread = CreateThread(NULL, 0, RenderThreadMain, NULL, 0, NULL);
+    if (!g_render_thread) {
+        return false;
+    }
+
+    WaitForSingleObject(g_render_ready_event, INFINITE);
+    CloseHandle(g_render_ready_event);
+    g_render_ready_event = NULL;
+    return InterlockedCompareExchange(&g_render_thread_ready, 0, 0) > 0;
+}
+
+static void StopRenderThread(void)
+{
+    if (g_render_thread) {
+        InterlockedExchange(&g_render_stop, 1);
+        if (g_render_wake_event) {
+            SetEvent(g_render_wake_event);
+        }
+        WaitForSingleObject(g_render_thread, INFINITE);
+        CloseHandle(g_render_thread);
+        g_render_thread = NULL;
+    }
+    if (g_render_ready_event) {
+        CloseHandle(g_render_ready_event);
+        g_render_ready_event = NULL;
+    }
+    if (g_render_wake_event) {
+        CloseHandle(g_render_wake_event);
+        g_render_wake_event = NULL;
+    }
+}
+
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR command_line, int show_command)
 {
     (void)previous_instance;
@@ -1566,12 +1759,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
     BeginTimerPrecision();
     ProfileInit();
 
-    if (!CreateRenderTimer() || !RegisterWindowClasses()) {
+    if (!RegisterWindowClasses()) {
         MessageBoxW(NULL, L"窗口类注册失败。", APP_NAME, MB_OK | MB_ICONERROR);
-        if (g_render_timer) {
-            CloseHandle(g_render_timer);
-            g_render_timer = NULL;
-        }
         ProfileClose();
         EndTimerPrecision();
         CloseHandle(mutex);
@@ -1595,44 +1784,30 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
     if (!hwnd) {
         MessageBoxW(NULL, L"DrawCursor 启动失败。", APP_NAME, MB_OK | MB_ICONERROR);
         ProfileClose();
-        CloseHandle(g_render_timer);
-        g_render_timer = NULL;
         EndTimerPrecision();
         CloseHandle(mutex);
         return 1;
     }
 
+    if (!StartRenderThread()) {
+        MessageBoxW(NULL, L"渲染线程启动失败。", APP_NAME, MB_OK | MB_ICONERROR);
+        DestroyWindow(hwnd);
+        StopRenderThread();
+        ProfileClose();
+        EndTimerPrecision();
+        CloseHandle(mutex);
+        return 1;
+    }
+    RequestCursorStateSync();
+
     MSG message;
     ZeroMemory(&message, sizeof(message));
-    bool running = true;
-    while (running) {
-        DWORD wait_result = MsgWaitForMultipleObjectsEx(
-            1,
-            &g_render_timer,
-            INFINITE,
-            QS_ALLINPUT,
-            MWMO_INPUTAVAILABLE);
-
-        if (wait_result == WAIT_OBJECT_0) {
-            ProcessRenderTimer();
-            continue;
-        }
-        if (wait_result != WAIT_OBJECT_0 + 1) {
-            break;
-        }
-
-        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
-            if (message.message == WM_QUIT) {
-                running = false;
-                break;
-            }
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+    while (GetMessageW(&message, NULL, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
     }
 
-    CloseHandle(g_render_timer);
-    g_render_timer = NULL;
+    StopRenderThread();
     ProfileClose();
     EndTimerPrecision();
     CloseHandle(mutex);
