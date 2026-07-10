@@ -145,6 +145,8 @@ static int g_canvas_w = 0;
 static int g_canvas_h = 0;
 static POINT g_last_rendered_cursor_pos = {0, 0};
 static bool g_have_rendered_cursor = false;
+static RECT g_last_canvas_cursor_rect = {0, 0, 0, 0};
+static bool g_have_canvas_cursor_rect = false;
 static HANDLE g_profile_file = INVALID_HANDLE_VALUE;
 static HANDLE g_profile_event;
 static HANDLE g_profile_thread;
@@ -846,39 +848,84 @@ static bool BuildCursorBitmapPixels(void)
     return ok;
 }
 
-static void CopyCursorToCanvas(int image_x, int image_y)
+static bool ClipCanvasRect(int image_x, int image_y, int width, int height, RECT *rect)
 {
-    int src_x = 0;
-    int src_y = 0;
-    int copy_w = g_cursor_bitmap_w;
-    int copy_h = g_cursor_bitmap_h;
+    rect->left = image_x < 0 ? 0 : image_x;
+    rect->top = image_y < 0 ? 0 : image_y;
+    rect->right = image_x + width;
+    rect->bottom = image_y + height;
 
-    if (image_x < 0) {
-        src_x = -image_x;
-        copy_w -= src_x;
-        image_x = 0;
+    if (rect->right > g_canvas_w) {
+        rect->right = g_canvas_w;
     }
-    if (image_y < 0) {
-        src_y = -image_y;
-        copy_h -= src_y;
-        image_y = 0;
+    if (rect->bottom > g_canvas_h) {
+        rect->bottom = g_canvas_h;
     }
-    if (image_x + copy_w > g_canvas_w) {
-        copy_w = g_canvas_w - image_x;
+    return rect->left < rect->right && rect->top < rect->bottom;
+}
+
+static void ClearCanvasRect(RECT rect)
+{
+    if (rect.left < 0) {
+        rect.left = 0;
     }
-    if (image_y + copy_h > g_canvas_h) {
-        copy_h = g_canvas_h - image_y;
+    if (rect.top < 0) {
+        rect.top = 0;
     }
-    if (copy_w <= 0 || copy_h <= 0) {
+    if (rect.right > g_canvas_w) {
+        rect.right = g_canvas_w;
+    }
+    if (rect.bottom > g_canvas_h) {
+        rect.bottom = g_canvas_h;
+    }
+    if (rect.left >= rect.right || rect.top >= rect.bottom) {
         return;
     }
 
+    SIZE_T row_bytes = (SIZE_T)(rect.right - rect.left) * sizeof(DWORD);
+    for (int y = rect.top; y < rect.bottom; ++y) {
+        ZeroMemory(g_canvas_pixels + y * g_canvas_w + rect.left, row_bytes);
+    }
+}
+
+static bool CopyCursorToCanvas(int image_x, int image_y, RECT *copied_rect)
+{
+    RECT rect;
+    if (!ClipCanvasRect(image_x, image_y, g_cursor_bitmap_w, g_cursor_bitmap_h, &rect)) {
+        return false;
+    }
+
+    int src_x = rect.left - image_x;
+    int src_y = rect.top - image_y;
+    int copy_w = rect.right - rect.left;
+    int copy_h = rect.bottom - rect.top;
+
     for (int y = 0; y < copy_h; ++y) {
-        DWORD *dst = g_canvas_pixels + (image_y + y) * g_canvas_w + image_x;
+        DWORD *dst = g_canvas_pixels + (rect.top + y) * g_canvas_w + rect.left;
         DWORD *src = g_cursor_pixels + (src_y + y) * g_cursor_bitmap_w + src_x;
         CopyMemory(dst, src, (SIZE_T)copy_w * sizeof(DWORD));
     }
+
+    *copied_rect = rect;
+    return true;
 }
+
+#ifdef DRAWCURSOR_VALIDATE_CANVAS
+static bool CanvasPixelsStayInside(RECT allowed)
+{
+    for (int y = 0; y < g_canvas_h; ++y) {
+        for (int x = 0; x < g_canvas_w; ++x) {
+            bool inside =
+                x >= allowed.left && x < allowed.right &&
+                y >= allowed.top && y < allowed.bottom;
+            if (!inside && g_canvas_pixels[y * g_canvas_w + x] != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+#endif
 
 static void ReleaseCanvasResources(void)
 {
@@ -901,6 +948,7 @@ static void ReleaseCanvasResources(void)
     g_canvas_w = 0;
     g_canvas_h = 0;
     g_have_rendered_cursor = false;
+    g_have_canvas_cursor_rect = false;
 }
 
 static void ReleaseCursorBitmapResources(void)
@@ -1098,15 +1146,35 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     }
 
     LARGE_INTEGER step_start = ProfileNow();
-    ZeroMemory(g_canvas_pixels, (size_t)g_canvas_w * (size_t)g_canvas_h * sizeof(DWORD));
+    if (force_update || !g_have_canvas_cursor_rect) {
+        ZeroMemory(g_canvas_pixels, (size_t)g_canvas_w * (size_t)g_canvas_h * sizeof(DWORD));
+    } else {
+        ClearCanvasRect(g_last_canvas_cursor_rect);
+    }
     ProfileAddDuration(&g_profile.fill_canvas, step_start, ProfileNow());
 
     int image_x = cursor_pos.x - g_cursor.hotspot_x - g_canvas_x;
     int image_y = cursor_pos.y - g_cursor.hotspot_y - g_canvas_y;
 
     step_start = ProfileNow();
-    CopyCursorToCanvas(image_x, image_y);
+    RECT copied_rect;
+    bool copied_cursor = CopyCursorToCanvas(image_x, image_y, &copied_rect);
     ProfileAddDuration(&g_profile.draw_icon, step_start, ProfileNow());
+
+    g_have_canvas_cursor_rect = copied_cursor;
+    if (copied_cursor) {
+        g_last_canvas_cursor_rect = copied_rect;
+    }
+
+#ifdef DRAWCURSOR_VALIDATE_CANVAS
+    RECT allowed = copied_cursor ? copied_rect : (RECT){0, 0, 0, 0};
+    if (!CanvasPixelsStayInside(allowed)) {
+        OutputDebugStringW(L"DrawCursor: canvas pixel escaped current cursor bounds\n");
+        PROFILE_INC(g_profile.render_fail);
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        return false;
+    }
+#endif
 
     POINT dst = {g_canvas_x, g_canvas_y};
     POINT src = {0, 0};
@@ -1170,6 +1238,7 @@ static bool SampleAndRenderCursor(bool force_update)
     if (!IsRedrawEnabled() || !g_overlay_hwnd) {
         g_cursor_showing = false;
         g_have_rendered_cursor = false;
+        g_have_canvas_cursor_rect = false;
         SetOverlayVisible(false);
         return false;
     }
@@ -1185,6 +1254,7 @@ static bool SampleAndRenderCursor(bool force_update)
         cursor_info.hCursor == NULL) {
         g_cursor_showing = false;
         g_have_rendered_cursor = false;
+        g_have_canvas_cursor_rect = false;
         PROFILE_INC(g_profile.cursor_hidden);
         SetOverlayVisible(false);
         return false;
@@ -1202,6 +1272,7 @@ static bool SampleAndRenderCursor(bool force_update)
             force_update || cursor_changed || !g_overlay_visible)) {
         g_cursor_showing = false;
         g_have_rendered_cursor = false;
+        g_have_canvas_cursor_rect = false;
         SetOverlayVisible(false);
         return false;
     }
