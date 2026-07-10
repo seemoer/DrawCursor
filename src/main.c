@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -48,6 +49,7 @@ typedef HANDLE(WINAPI *CreateWaitableTimerExFn)(
 typedef HANDLE(WINAPI *AvSetMmThreadCharacteristicsFn)(LPCWSTR, LPDWORD);
 typedef BOOL(WINAPI *AvSetMmThreadPriorityFn)(HANDLE, int);
 typedef BOOL(WINAPI *AvRevertMmThreadCharacteristicsFn)(HANDLE);
+typedef HRESULT(WINAPI *DwmGetCompositionTimingInfoFn)(HWND, DWM_TIMING_INFO *);
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
@@ -84,12 +86,16 @@ typedef struct ProfileStats {
     volatile LONG64 timer_started;
     volatile LONG64 timer_stopped;
     volatile LONG64 overlay_shown;
+    volatile LONG64 dwm_timing_success;
+    volatile LONG64 dwm_timing_fail;
     DurationStats get_cursor_info;
     DurationStats fill_canvas;
     DurationStats draw_icon;
     DurationStats update_layered;
     DurationStats render_total;
     DurationStats input_to_render;
+    DurationStats refresh_period;
+    DurationStats deadline_late;
 } ProfileStats;
 
 typedef struct ProfileRow {
@@ -161,6 +167,16 @@ static LARGE_INTEGER g_profile_start_time;
 static LARGE_INTEGER g_profile_last_snapshot_time;
 static ProfileStats g_profile;
 static volatile LONG64 g_latest_input_qpc = 0;
+static HMODULE g_dwmapi;
+static DwmGetCompositionTimingInfoFn g_dwm_get_timing;
+static bool g_dwm_timing_disabled = false;
+static LONG64 g_refresh_period_qpc = 0;
+static LONG64 g_last_vblank_qpc = 0;
+static LONG64 g_last_dwm_query_qpc = 0;
+static LONG64 g_render_timer_deadline_qpc = 0;
+static LONG64 g_render_cadence_deadline_qpc = 0;
+static ULONGLONG g_submit_cost_ewma_us = 750;
+static HMONITOR g_last_cursor_monitor;
 
 static void ReleaseCursorBitmapResources(void);
 
@@ -233,9 +249,9 @@ static ULONGLONG ProfileElapsedUs(LARGE_INTEGER start, LARGE_INTEGER end)
     return (ULONGLONG)(((end.QuadPart - start.QuadPart) * 1000000LL) / g_qpc_frequency.QuadPart);
 }
 
-static void ProfileAddDuration(DurationStats *stats, LARGE_INTEGER start, LARGE_INTEGER end)
+static void ProfileAddValue(DurationStats *stats, ULONGLONG value_us)
 {
-    LONG64 elapsed_us = (LONG64)ProfileElapsedUs(start, end);
+    LONG64 elapsed_us = (LONG64)value_us;
     PROFILE_INC(stats->count);
     InterlockedAdd64(&stats->total_us, elapsed_us);
 
@@ -247,6 +263,11 @@ static void ProfileAddDuration(DurationStats *stats, LARGE_INTEGER start, LARGE_
         }
         previous_max = observed;
     }
+}
+
+static void ProfileAddDuration(DurationStats *stats, LARGE_INTEGER start, LARGE_INTEGER end)
+{
+    ProfileAddValue(stats, ProfileElapsedUs(start, end));
 }
 
 static ULONGLONG ProfileAvgUs(DurationStats stats)
@@ -315,6 +336,8 @@ static void ProfileTakeStats(ProfileStats *snapshot)
     PROFILE_TAKE_COUNTER(timer_started);
     PROFILE_TAKE_COUNTER(timer_stopped);
     PROFILE_TAKE_COUNTER(overlay_shown);
+    PROFILE_TAKE_COUNTER(dwm_timing_success);
+    PROFILE_TAKE_COUNTER(dwm_timing_fail);
 #undef PROFILE_TAKE_COUNTER
 
     ProfileTakeDuration(&g_profile.get_cursor_info, &snapshot->get_cursor_info);
@@ -323,6 +346,8 @@ static void ProfileTakeStats(ProfileStats *snapshot)
     ProfileTakeDuration(&g_profile.update_layered, &snapshot->update_layered);
     ProfileTakeDuration(&g_profile.render_total, &snapshot->render_total);
     ProfileTakeDuration(&g_profile.input_to_render, &snapshot->input_to_render);
+    ProfileTakeDuration(&g_profile.refresh_period, &snapshot->refresh_period);
+    ProfileTakeDuration(&g_profile.deadline_late, &snapshot->deadline_late);
 }
 
 static void ProfileWriteRow(const ProfileRow *row)
@@ -333,7 +358,8 @@ static void ProfileWriteRow(const ProfileRow *row)
         line,
         sizeof(line),
         "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
-        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
+        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
+        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
         row->since_start_ms,
         row->interval_ms,
         (ULONGLONG)stats->input_events,
@@ -365,7 +391,13 @@ static void ProfileWriteRow(const ProfileRow *row)
         (ULONGLONG)stats->update_layered.count,
         (ULONGLONG)stats->render_total.count,
         ProfileAvgUs(stats->input_to_render),
-        (ULONGLONG)stats->input_to_render.max_us);
+        (ULONGLONG)stats->input_to_render.max_us,
+        (ULONGLONG)stats->dwm_timing_success,
+        (ULONGLONG)stats->dwm_timing_fail,
+        ProfileAvgUs(stats->refresh_period),
+        (ULONGLONG)stats->refresh_period.max_us,
+        ProfileAvgUs(stats->deadline_late),
+        (ULONGLONG)stats->deadline_late.max_us);
 
     if (len > 0) {
         ProfileWrite(line);
@@ -464,7 +496,8 @@ static void ProfileInit(void)
         "getcursorinfo_avg_us,getcursorinfo_max_us,fill_avg_us,fill_max_us,drawicon_avg_us,drawicon_max_us,"
         "update_layered_avg_us,update_layered_max_us,render_total_avg_us,"
         "render_total_max_us,update_layered_calls,render_total_calls,input_to_render_avg_us,"
-        "input_to_render_max_us\n");
+        "input_to_render_max_us,dwm_timing_success,dwm_timing_fail,refresh_period_avg_us,"
+        "refresh_period_max_us,deadline_late_avg_us,deadline_late_max_us\n");
 
     InitializeCriticalSection(&g_profile_queue_lock);
     g_profile_queue_lock_ready = true;
@@ -1196,13 +1229,18 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
         0,
         &blend,
         ULW_ALPHA);
-    ProfileAddDuration(&g_profile.update_layered, step_start, ProfileNow());
+    LARGE_INTEGER update_end = ProfileNow();
+    ULONGLONG update_us = ProfileElapsedUs(step_start, update_end);
+    ProfileAddValue(&g_profile.update_layered, update_us);
 
     if (!ok) {
         PROFILE_INC(g_profile.render_fail);
         ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
         return false;
     }
+
+    ULONGLONG bounded_update_us = update_us > 4000 ? 4000 : update_us;
+    g_submit_cost_ewma_us = (g_submit_cost_ewma_us * 7 + bounded_update_us) / 8;
 
     if (!g_overlay_visible) {
         SetWindowPos(
@@ -1261,6 +1299,11 @@ static bool SampleAndRenderCursor(bool force_update)
     }
 
     g_cursor_showing = true;
+    HMONITOR cursor_monitor = MonitorFromPoint(cursor_info.ptScreenPos, MONITOR_DEFAULTTONEAREST);
+    if (cursor_monitor != g_last_cursor_monitor) {
+        g_last_cursor_monitor = cursor_monitor;
+        g_last_dwm_query_qpc = 0;
+    }
     bool cursor_changed = cursor_info.hCursor != g_cursor.handle;
     if (cursor_changed) {
         PROFILE_INC(g_profile.cursor_changed);
@@ -1279,6 +1322,139 @@ static bool SampleAndRenderCursor(bool force_update)
     return true;
 }
 
+static LONG64 QpcTicksFromUs(ULONGLONG microseconds)
+{
+    return (LONG64)((microseconds * (ULONGLONG)g_qpc_frequency.QuadPart) / 1000000ULL);
+}
+
+static void InitDwmTiming(void)
+{
+    WCHAR disabled[2];
+    g_dwm_timing_disabled = GetEnvironmentVariableW(
+        L"DRAWCURSOR_DISABLE_DWM_TIMING",
+        disabled,
+        ARRAYSIZE(disabled)) > 0;
+    if (g_dwm_timing_disabled) {
+        return;
+    }
+
+    g_dwmapi = LoadLibraryW(L"dwmapi.dll");
+    if (!g_dwmapi) {
+        return;
+    }
+
+    union {
+        FARPROC proc;
+        DwmGetCompositionTimingInfoFn fn;
+    } dwm;
+    dwm.proc = GetProcAddress(g_dwmapi, "DwmGetCompositionTimingInfo");
+    g_dwm_get_timing = dwm.fn;
+}
+
+static void CloseDwmTiming(void)
+{
+    g_dwm_get_timing = NULL;
+    if (g_dwmapi) {
+        FreeLibrary(g_dwmapi);
+        g_dwmapi = NULL;
+    }
+    g_refresh_period_qpc = 0;
+    g_last_vblank_qpc = 0;
+    g_last_dwm_query_qpc = 0;
+    g_last_cursor_monitor = NULL;
+}
+
+static void RefreshDwmTiming(LONG64 now_qpc, bool force)
+{
+    LONG64 query_interval = g_qpc_frequency.QuadPart;
+    if (!force &&
+        g_last_dwm_query_qpc > 0 &&
+        now_qpc - g_last_dwm_query_qpc < query_interval) {
+        return;
+    }
+    g_last_dwm_query_qpc = now_qpc;
+
+    if (!g_dwm_get_timing) {
+        g_refresh_period_qpc = 0;
+        g_last_vblank_qpc = 0;
+        PROFILE_INC(g_profile.dwm_timing_fail);
+        return;
+    }
+
+    DWM_TIMING_INFO timing;
+    ZeroMemory(&timing, sizeof(timing));
+    timing.cbSize = sizeof(timing);
+    HRESULT result = g_dwm_get_timing(NULL, &timing);
+
+    ULONGLONG min_period = (ULONGLONG)g_qpc_frequency.QuadPart / 1000ULL;
+    ULONGLONG max_period = (ULONGLONG)g_qpc_frequency.QuadPart / 10ULL;
+    if (FAILED(result) ||
+        timing.qpcRefreshPeriod == 0 ||
+        timing.qpcRefreshPeriod < min_period ||
+        timing.qpcRefreshPeriod > max_period ||
+        timing.qpcVBlank == 0) {
+        g_refresh_period_qpc = 0;
+        g_last_vblank_qpc = 0;
+        PROFILE_INC(g_profile.dwm_timing_fail);
+        return;
+    }
+
+    g_refresh_period_qpc = (LONG64)timing.qpcRefreshPeriod;
+    g_last_vblank_qpc = (LONG64)timing.qpcVBlank;
+    PROFILE_INC(g_profile.dwm_timing_success);
+    ProfileAddValue(
+        &g_profile.refresh_period,
+        (ULONGLONG)((timing.qpcRefreshPeriod * 1000000LL) / g_qpc_frequency.QuadPart));
+}
+
+static LONG64 ComputeNextRenderDeadline(LONG64 now_qpc)
+{
+    RefreshDwmTiming(now_qpc, false);
+
+    LONG64 maximum_interval = QpcTicksFromUs(RENDER_INTERVAL_MS * 1000ULL);
+    if (g_refresh_period_qpc > 0 && g_refresh_period_qpc / 2 < maximum_interval) {
+        maximum_interval = g_refresh_period_qpc / 2;
+    }
+    LONG64 minimum_interval = QpcTicksFromUs(500);
+    if (maximum_interval < minimum_interval) {
+        maximum_interval = minimum_interval;
+    }
+
+    if (g_render_cadence_deadline_qpc == 0 ||
+        g_render_cadence_deadline_qpc > now_qpc + maximum_interval) {
+        g_render_cadence_deadline_qpc = now_qpc + maximum_interval;
+    } else {
+        while (g_render_cadence_deadline_qpc <= now_qpc) {
+            g_render_cadence_deadline_qpc += maximum_interval;
+        }
+    }
+
+    LONG64 deadline = g_render_cadence_deadline_qpc;
+    if (g_refresh_period_qpc > 0 && g_last_vblank_qpc > 0) {
+        LONG64 next_vblank = g_last_vblank_qpc;
+        if (next_vblank <= now_qpc) {
+            LONG64 periods = (now_qpc - next_vblank) / g_refresh_period_qpc + 1;
+            next_vblank += periods * g_refresh_period_qpc;
+        }
+
+        ULONGLONG lead_us = g_submit_cost_ewma_us + 250;
+        if (lead_us < 500) {
+            lead_us = 500;
+        }
+        if (lead_us > 2000) {
+            lead_us = 2000;
+        }
+        LONG64 phase_deadline = next_vblank - QpcTicksFromUs(lead_us);
+        while (phase_deadline <= now_qpc) {
+            phase_deadline += g_refresh_period_qpc;
+        }
+        if (phase_deadline < deadline) {
+            deadline = phase_deadline;
+        }
+    }
+    return deadline;
+}
+
 static void StopRenderTimer(void)
 {
     if (g_render_timer_active && g_render_timer) {
@@ -1287,16 +1463,28 @@ static void StopRenderTimer(void)
     }
 
     g_render_timer_active = false;
+    g_render_timer_deadline_qpc = 0;
+    g_render_cadence_deadline_qpc = 0;
 }
 
-static bool ArmRenderTimer(DWORD delay_ms)
+static bool ArmRenderTimerDeadline(LONG64 deadline_qpc)
 {
     if (!g_render_timer) {
         return false;
     }
 
+    LARGE_INTEGER now = ProfileNow();
+    LONG64 remaining_qpc = deadline_qpc - now.QuadPart;
+    LONGLONG remaining_100ns =
+        remaining_qpc > 0
+            ? (remaining_qpc * 10000000LL) / g_qpc_frequency.QuadPart
+            : 1;
+    if (remaining_100ns < 1) {
+        remaining_100ns = 1;
+    }
+
     LARGE_INTEGER due_time;
-    due_time.QuadPart = -(LONGLONG)delay_ms * 10000LL;
+    due_time.QuadPart = -remaining_100ns;
     if (!SetWaitableTimer(g_render_timer, &due_time, 0, NULL, NULL, FALSE)) {
         g_render_timer_active = false;
         return false;
@@ -1306,13 +1494,20 @@ static bool ArmRenderTimer(DWORD delay_ms)
         PROFILE_INC(g_profile.timer_started);
     }
     g_render_timer_active = true;
+    g_render_timer_deadline_qpc = deadline_qpc;
     return true;
+}
+
+static bool ScheduleNextRender(void)
+{
+    LARGE_INTEGER now = ProfileNow();
+    return ArmRenderTimerDeadline(ComputeNextRenderDeadline(now.QuadPart));
 }
 
 static void StartRenderTimer(void)
 {
     if (!g_render_timer_active) {
-        ArmRenderTimer(RENDER_INTERVAL_MS);
+        ScheduleNextRender();
     }
 }
 
@@ -1323,11 +1518,17 @@ static void ProcessRenderTimer(void)
     }
 
     PROFILE_INC(g_profile.render_timer_ticks);
+    LARGE_INTEGER timer_fired = ProfileNow();
+    if (g_render_timer_deadline_qpc > 0 && timer_fired.QuadPart > g_render_timer_deadline_qpc) {
+        LARGE_INTEGER deadline;
+        deadline.QuadPart = g_render_timer_deadline_qpc;
+        ProfileAddDuration(&g_profile.deadline_late, deadline, timer_fired);
+    }
     bool cursor_available = SampleAndRenderCursor(false);
 
     DWORD last_input_tick = (DWORD)InterlockedCompareExchange(&g_last_input_tick, 0, 0);
     if (cursor_available && IsRedrawEnabled() && GetTickCount() - last_input_tick <= MOTION_IDLE_MS) {
-        ArmRenderTimer(RENDER_INTERVAL_MS);
+        ScheduleNextRender();
     } else {
         StopRenderTimer();
     }
@@ -1697,6 +1898,7 @@ static DWORD WINAPI RenderThreadMain(void *parameter)
 {
     (void)parameter;
     RenderMmcssState mmcss = BeginRenderMmcss();
+    InitDwmTiming();
 
     bool initialized = CreateRenderTimer() && CreateOverlayWindow();
     InterlockedExchange(&g_render_thread_ready, initialized ? 1 : -1);
@@ -1711,6 +1913,7 @@ static DWORD WINAPI RenderThreadMain(void *parameter)
             CloseHandle(g_render_timer);
             g_render_timer = NULL;
         }
+        CloseDwmTiming();
         EndRenderMmcss(&mmcss);
         return 1;
     }
@@ -1761,6 +1964,7 @@ static DWORD WINAPI RenderThreadMain(void *parameter)
     ReleaseCursorBitmapResources();
     CloseHandle(g_render_timer);
     g_render_timer = NULL;
+    CloseDwmTiming();
     EndRenderMmcss(&mmcss);
     return 0;
 }
