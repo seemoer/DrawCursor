@@ -20,6 +20,7 @@
 #define OVERLAY_CLASS_NAME L"DrawCursor.CursorOverlay"
 
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_RENDER_MODE_FALLBACK (WM_APP + 2)
 #define TIMER_CURSOR 1
 #define TIMER_INTERVAL_MS 50
 #define RENDER_INTERVAL_MS 4
@@ -30,8 +31,13 @@
 #define IDM_ENABLE 1001
 #define IDM_DISABLE 1002
 #define IDM_EXIT 1003
+#define IDM_MODE_COMPAT 1004
+#define IDM_MODE_FAST 1005
 
 #define TRAY_ICON_ID 1
+
+#define RENDER_MODE_COMPAT 0
+#define RENDER_MODE_FAST 1
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -92,6 +98,9 @@ typedef struct ProfileStats {
     volatile LONG64 input_buffered_events;
     volatile LONG64 input_coalesced;
     volatile LONG64 input_buffer_failures;
+    volatile LONG64 fast_move_success;
+    volatile LONG64 fast_full_update;
+    volatile LONG64 fast_fallback;
     DurationStats get_cursor_info;
     DurationStats fill_canvas;
     DurationStats draw_icon;
@@ -135,6 +144,9 @@ static volatile LONG g_render_requested = 0;
 static volatile LONG g_state_sync_requested = 0;
 static volatile LONG g_force_render_requested = 0;
 static volatile LONG g_last_input_tick = 0;
+static volatile LONG g_render_mode = RENDER_MODE_COMPAT;
+static LONG g_render_mode_applied = -1;
+static unsigned int g_fast_position_failures = 0;
 static CursorMetrics g_cursor;
 static HMODULE g_winmm;
 static TimePeriodFn g_time_begin_period;
@@ -350,6 +362,9 @@ static void ProfileTakeStats(ProfileStats *snapshot)
     PROFILE_TAKE_COUNTER(input_buffered_events);
     PROFILE_TAKE_COUNTER(input_coalesced);
     PROFILE_TAKE_COUNTER(input_buffer_failures);
+    PROFILE_TAKE_COUNTER(fast_move_success);
+    PROFILE_TAKE_COUNTER(fast_full_update);
+    PROFILE_TAKE_COUNTER(fast_fallback);
 #undef PROFILE_TAKE_COUNTER
 
     ProfileTakeDuration(&g_profile.get_cursor_info, &snapshot->get_cursor_info);
@@ -371,7 +386,7 @@ static void ProfileWriteRow(const ProfileRow *row)
         sizeof(line),
         "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
         "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,"
-        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
+        "%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u,%I64u\n",
         row->since_start_ms,
         row->interval_ms,
         (ULONGLONG)stats->input_events,
@@ -413,7 +428,10 @@ static void ProfileWriteRow(const ProfileRow *row)
         (ULONGLONG)stats->input_batches,
         (ULONGLONG)stats->input_buffered_events,
         (ULONGLONG)stats->input_coalesced,
-        (ULONGLONG)stats->input_buffer_failures);
+        (ULONGLONG)stats->input_buffer_failures,
+        (ULONGLONG)stats->fast_move_success,
+        (ULONGLONG)stats->fast_full_update,
+        (ULONGLONG)stats->fast_fallback);
 
     if (len > 0) {
         ProfileWrite(line);
@@ -514,7 +532,8 @@ static void ProfileInit(void)
         "render_total_max_us,update_layered_calls,render_total_calls,input_to_render_avg_us,"
         "input_to_render_max_us,dwm_timing_success,dwm_timing_fail,refresh_period_avg_us,"
         "refresh_period_max_us,deadline_late_avg_us,deadline_late_max_us,input_batches,"
-        "input_buffered_events,input_coalesced,input_buffer_failures\n");
+        "input_buffered_events,input_coalesced,input_buffer_failures,fast_move_success,"
+        "fast_full_update,fast_fallback\n");
 
     InitializeCriticalSection(&g_profile_queue_lock);
     g_profile_queue_lock_ready = true;
@@ -1152,7 +1171,7 @@ static bool CursorFitsCanvas(POINT cursor_pos)
         image_bottom <= g_canvas_y + g_canvas_h - CURSOR_CANVAS_MARGIN;
 }
 
-static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
+static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
 {
     LARGE_INTEGER render_start = ProfileNow();
     PROFILE_INC(g_profile.render_attempts);
@@ -1280,6 +1299,190 @@ static bool RenderCursorCanvas(POINT cursor_pos, bool force_update)
     return true;
 }
 
+static bool FallbackToCompatibility(POINT cursor_pos, LARGE_INTEGER fast_render_start)
+{
+    PROFILE_INC(g_profile.fast_fallback);
+    InterlockedExchange(&g_render_mode, RENDER_MODE_COMPAT);
+    g_render_mode_applied = RENDER_MODE_COMPAT;
+    g_fast_position_failures = 0;
+    SetOverlayVisible(false);
+    ReleaseCanvasResources();
+    if (g_main_hwnd) {
+        PostMessageW(g_main_hwnd, WM_RENDER_MODE_FALLBACK, 0, 0);
+    }
+    ProfileAddDuration(&g_profile.render_total, fast_render_start, ProfileNow());
+    return RenderCursorCompatibility(cursor_pos, true);
+}
+
+static bool RenderCursorFast(POINT cursor_pos, bool force_update)
+{
+    LARGE_INTEGER render_start = ProfileNow();
+    PROFILE_INC(g_profile.render_attempts);
+    if (force_update) {
+        PROFILE_INC(g_profile.render_force);
+    }
+
+    if (!IsRedrawEnabled() || !g_overlay_hwnd || !g_cursor_showing || !g_cursor.handle) {
+        PROFILE_INC(g_profile.render_fail);
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        return false;
+    }
+
+    int destination_x = cursor_pos.x - g_cursor.hotspot_x;
+    int destination_y = cursor_pos.y - g_cursor.hotspot_y;
+    bool surface_ready =
+        g_canvas_dc &&
+        g_canvas_bitmap &&
+        g_canvas_w == g_cursor.width &&
+        g_canvas_h == g_cursor.height &&
+        g_have_canvas_cursor_rect;
+
+    if (!force_update &&
+        surface_ready &&
+        g_overlay_visible &&
+        g_have_rendered_cursor &&
+        cursor_pos.x == g_last_rendered_cursor_pos.x &&
+        cursor_pos.y == g_last_rendered_cursor_pos.y) {
+        PROFILE_INC(g_profile.render_noop_same_pos);
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        return true;
+    }
+
+    if (!force_update && surface_ready && g_overlay_visible) {
+        LARGE_INTEGER move_start = ProfileNow();
+#ifdef DRAWCURSOR_FAST_TEST_FAIL_POSITION
+        BOOL moved = FALSE;
+#else
+        POINT destination = {destination_x, destination_y};
+        BOOL moved = UpdateLayeredWindow(
+            g_overlay_hwnd,
+            NULL,
+            &destination,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            NULL,
+            0);
+#endif
+        LARGE_INTEGER move_end = ProfileNow();
+        ProfileAddDuration(&g_profile.update_layered, move_start, move_end);
+
+        if (moved) {
+            g_fast_position_failures = 0;
+            g_canvas_x = destination_x;
+            g_canvas_y = destination_y;
+            g_last_rendered_cursor_pos = cursor_pos;
+            g_have_rendered_cursor = true;
+            PROFILE_INC(g_profile.fast_move_success);
+            PROFILE_INC(g_profile.render_success);
+            ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+            return true;
+        }
+
+        ++g_fast_position_failures;
+        if (g_fast_position_failures >= 3) {
+            return FallbackToCompatibility(cursor_pos, render_start);
+        }
+    }
+
+    bool redraw_surface = force_update || !surface_ready;
+    if (!EnsureCursorBitmapResources() ||
+        !EnsureCanvasResources(g_cursor.width, g_cursor.height)) {
+        PROFILE_INC(g_profile.render_fail);
+        return FallbackToCompatibility(cursor_pos, render_start);
+    }
+
+    if (redraw_surface) {
+        LARGE_INTEGER fill_start = ProfileNow();
+        ZeroMemory(g_canvas_pixels, (size_t)g_canvas_w * (size_t)g_canvas_h * sizeof(DWORD));
+        ProfileAddDuration(&g_profile.fill_canvas, fill_start, ProfileNow());
+
+        LARGE_INTEGER draw_start = ProfileNow();
+        RECT copied_rect;
+        bool copied_cursor = CopyCursorToCanvas(0, 0, &copied_rect);
+        ProfileAddDuration(&g_profile.draw_icon, draw_start, ProfileNow());
+        g_have_canvas_cursor_rect = copied_cursor;
+        if (copied_cursor) {
+            g_last_canvas_cursor_rect = copied_rect;
+        }
+        if (!copied_cursor) {
+            PROFILE_INC(g_profile.render_fail);
+            return FallbackToCompatibility(cursor_pos, render_start);
+        }
+
+#ifdef DRAWCURSOR_VALIDATE_CANVAS
+        if (!CanvasPixelsStayInside(copied_rect)) {
+            OutputDebugStringW(L"DrawCursor: fast canvas pixel escaped cursor bounds\n");
+            PROFILE_INC(g_profile.render_fail);
+            return FallbackToCompatibility(cursor_pos, render_start);
+        }
+#endif
+    }
+
+    POINT destination = {destination_x, destination_y};
+    POINT source = {0, 0};
+    SIZE size = {g_canvas_w, g_canvas_h};
+    BLENDFUNCTION blend;
+    ZeroMemory(&blend, sizeof(blend));
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+
+    LARGE_INTEGER update_start = ProfileNow();
+    BOOL updated = UpdateLayeredWindow(
+        g_overlay_hwnd,
+        NULL,
+        &destination,
+        &size,
+        g_canvas_dc,
+        &source,
+        0,
+        &blend,
+        ULW_ALPHA);
+    LARGE_INTEGER update_end = ProfileNow();
+    ULONGLONG update_us = ProfileElapsedUs(update_start, update_end);
+    ProfileAddValue(&g_profile.update_layered, update_us);
+    if (!updated) {
+        PROFILE_INC(g_profile.render_fail);
+        return FallbackToCompatibility(cursor_pos, render_start);
+    }
+
+    ULONGLONG bounded_update_us = update_us > 4000 ? 4000 : update_us;
+    g_submit_cost_ewma_us = (g_submit_cost_ewma_us * 7 + bounded_update_us) / 8;
+    g_canvas_x = destination_x;
+    g_canvas_y = destination_y;
+
+    if (!g_overlay_visible) {
+        SetWindowPos(
+            g_overlay_hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW);
+        ShowWindow(g_overlay_hwnd, SW_SHOWNOACTIVATE);
+        g_overlay_visible = true;
+        PROFILE_INC(g_profile.overlay_shown);
+    }
+
+    g_last_rendered_cursor_pos = cursor_pos;
+    g_have_rendered_cursor = true;
+    PROFILE_INC(g_profile.fast_full_update);
+    PROFILE_INC(g_profile.render_success);
+    ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+    return true;
+}
+
+static bool RenderCursorForMode(POINT cursor_pos, bool force_update)
+{
+    if (g_render_mode_applied == RENDER_MODE_FAST) {
+        return RenderCursorFast(cursor_pos, force_update);
+    }
+    return RenderCursorCompatibility(cursor_pos, force_update);
+}
+
 static bool SampleAndRenderCursor(bool force_update)
 {
     LARGE_INTEGER step_start = ProfileNow();
@@ -1321,13 +1524,22 @@ static bool SampleAndRenderCursor(bool force_update)
         g_last_cursor_monitor = cursor_monitor;
         g_last_dwm_query_qpc = 0;
     }
+
+    LONG requested_mode = InterlockedCompareExchange(&g_render_mode, 0, 0);
+    if (requested_mode != g_render_mode_applied) {
+        SetOverlayVisible(false);
+        ReleaseCanvasResources();
+        g_render_mode_applied = requested_mode;
+        g_fast_position_failures = 0;
+        force_update = true;
+    }
     bool cursor_changed = cursor_info.hCursor != g_cursor.handle;
     if (cursor_changed) {
         PROFILE_INC(g_profile.cursor_changed);
         UpdateCursorMetrics(cursor_info.hCursor);
     }
 
-    if (!RenderCursorCanvas(
+    if (!RenderCursorForMode(
             cursor_info.ptScreenPos,
             force_update || cursor_changed || !g_overlay_visible)) {
         g_cursor_showing = false;
@@ -1752,10 +1964,14 @@ static void UpdateTrayIconTip(void)
     g_tray.hWnd = g_main_hwnd;
     g_tray.uID = TRAY_ICON_ID;
     g_tray.uFlags = NIF_TIP;
-    lstrcpynW(
-        g_tray.szTip,
-        IsRedrawEnabled() ? L"DrawCursor - 重绘已打开" : L"DrawCursor - 重绘已关闭",
-        ARRAYSIZE(g_tray.szTip));
+    bool fast_mode = InterlockedCompareExchange(&g_render_mode, 0, 0) == RENDER_MODE_FAST;
+    const WCHAR *tip;
+    if (IsRedrawEnabled()) {
+        tip = fast_mode ? L"DrawCursor - 重绘已打开（极速模式）" : L"DrawCursor - 重绘已打开（兼容模式）";
+    } else {
+        tip = fast_mode ? L"DrawCursor - 重绘已关闭（极速模式）" : L"DrawCursor - 重绘已关闭（兼容模式）";
+    }
+    lstrcpynW(g_tray.szTip, tip, ARRAYSIZE(g_tray.szTip));
 
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
@@ -1769,7 +1985,7 @@ static bool AddTrayIcon(HWND hwnd)
     g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_tray.uCallbackMessage = WM_TRAYICON;
     g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
-    lstrcpynW(g_tray.szTip, L"DrawCursor - 重绘已打开", ARRAYSIZE(g_tray.szTip));
+    lstrcpynW(g_tray.szTip, L"DrawCursor - 重绘已打开（兼容模式）", ARRAYSIZE(g_tray.szTip));
 
     return Shell_NotifyIconW(NIM_ADD, &g_tray) != FALSE;
 }
@@ -1800,6 +2016,10 @@ static void ShowTrayMenu(HWND hwnd)
     AppendMenuW(menu, MF_STRING, IDM_ENABLE, IsRedrawEnabled() ? L"打开重绘  \x2022" : L"打开重绘");
     AppendMenuW(menu, MF_STRING, IDM_DISABLE, IsRedrawEnabled() ? L"关闭重绘" : L"关闭重绘  \x2022");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    bool fast_mode = InterlockedCompareExchange(&g_render_mode, 0, 0) == RENDER_MODE_FAST;
+    AppendMenuW(menu, MF_STRING, IDM_MODE_COMPAT, fast_mode ? L"兼容模式" : L"兼容模式  \x2022");
+    AppendMenuW(menu, MF_STRING, IDM_MODE_FAST, fast_mode ? L"极速模式  \x2022" : L"极速模式");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"关闭 DrawCursor");
 
     SetForegroundWindow(hwnd);
@@ -1817,6 +2037,17 @@ static void SetRedrawEnabled(bool enabled)
     }
 
     InterlockedExchange(&g_force_render_requested, enabled_value);
+    RequestCursorStateSync();
+    UpdateTrayIconTip();
+}
+
+static void SetRenderMode(LONG mode)
+{
+    if (InterlockedExchange(&g_render_mode, mode) == mode) {
+        return;
+    }
+
+    InterlockedExchange(&g_force_render_requested, 1);
     RequestCursorStateSync();
     UpdateTrayIconTip();
 }
@@ -1903,11 +2134,21 @@ static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wparam, L
         case IDM_DISABLE:
             SetRedrawEnabled(false);
             return 0;
+        case IDM_MODE_COMPAT:
+            SetRenderMode(RENDER_MODE_COMPAT);
+            return 0;
+        case IDM_MODE_FAST:
+            SetRenderMode(RENDER_MODE_FAST);
+            return 0;
         case IDM_EXIT:
             DestroyWindow(hwnd);
             return 0;
         }
         break;
+
+    case WM_RENDER_MODE_FALLBACK:
+        UpdateTrayIconTip();
+        return 0;
 
     case WM_TRAYICON:
         if (LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == WM_CONTEXTMENU) {
