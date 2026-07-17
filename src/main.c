@@ -144,6 +144,9 @@ static volatile LONG g_render_requested = 0;
 static volatile LONG g_state_sync_requested = 0;
 static volatile LONG g_force_render_requested = 0;
 static volatile LONG g_last_input_tick = 0;
+static volatile LONG64 g_input_generation = 0;
+static LONG64 g_rendered_input_generation = 0;
+static DWORD g_last_motion_render_tick = 0;
 static volatile LONG g_render_mode = RENDER_MODE_COMPAT;
 static LONG g_render_mode_applied = -1;
 static unsigned int g_fast_position_failures = 0;
@@ -192,7 +195,6 @@ static LONG64 g_refresh_period_qpc = 0;
 static LONG64 g_last_vblank_qpc = 0;
 static LONG64 g_last_dwm_query_qpc = 0;
 static LONG64 g_render_timer_deadline_qpc = 0;
-static LONG64 g_render_cadence_deadline_qpc = 0;
 static ULONGLONG g_submit_cost_ewma_us = 750;
 static HMONITOR g_last_cursor_monitor;
 static BYTE *g_raw_input_buffer;
@@ -1767,25 +1769,7 @@ static LONG64 ComputeNextRenderDeadline(LONG64 now_qpc)
 {
     RefreshDwmTiming(now_qpc, false);
 
-    LONG64 maximum_interval = QpcTicksFromUs(RENDER_INTERVAL_MS * 1000ULL);
-    if (g_refresh_period_qpc > 0 && g_refresh_period_qpc / 2 < maximum_interval) {
-        maximum_interval = g_refresh_period_qpc / 2;
-    }
-    LONG64 minimum_interval = QpcTicksFromUs(500);
-    if (maximum_interval < minimum_interval) {
-        maximum_interval = minimum_interval;
-    }
-
-    if (g_render_cadence_deadline_qpc == 0 ||
-        g_render_cadence_deadline_qpc > now_qpc + maximum_interval) {
-        g_render_cadence_deadline_qpc = now_qpc + maximum_interval;
-    } else {
-        while (g_render_cadence_deadline_qpc <= now_qpc) {
-            g_render_cadence_deadline_qpc += maximum_interval;
-        }
-    }
-
-    LONG64 deadline = g_render_cadence_deadline_qpc;
+    LONG64 deadline = now_qpc + QpcTicksFromUs(RENDER_INTERVAL_MS * 1000ULL);
     if (g_refresh_period_qpc > 0 && g_last_vblank_qpc > 0) {
         LONG64 next_vblank = g_last_vblank_qpc;
         if (next_vblank <= now_qpc) {
@@ -1804,9 +1788,7 @@ static LONG64 ComputeNextRenderDeadline(LONG64 now_qpc)
         while (phase_deadline <= now_qpc) {
             phase_deadline += g_refresh_period_qpc;
         }
-        if (phase_deadline < deadline) {
-            deadline = phase_deadline;
-        }
+        deadline = phase_deadline;
     }
     return deadline;
 }
@@ -1820,7 +1802,6 @@ static void StopRenderTimer(void)
 
     g_render_timer_active = false;
     g_render_timer_deadline_qpc = 0;
-    g_render_cadence_deadline_qpc = 0;
 }
 
 static bool ArmRenderTimerDeadline(LONG64 deadline_qpc)
@@ -1860,7 +1841,7 @@ static bool ScheduleNextRender(void)
     return ArmRenderTimerDeadline(ComputeNextRenderDeadline(now.QuadPart));
 }
 
-static void StartRenderTimer(void)
+static void ScheduleDirtyRender(void)
 {
     if (!g_render_timer_active) {
         ScheduleNextRender();
@@ -1880,13 +1861,21 @@ static void ProcessRenderTimer(void)
         deadline.QuadPart = g_render_timer_deadline_qpc;
         ProfileAddDuration(&g_profile.deadline_late, deadline, timer_fired);
     }
-    bool cursor_available = SampleAndRenderCursor(false);
+    g_render_timer_active = false;
+    g_render_timer_deadline_qpc = 0;
 
-    DWORD last_input_tick = (DWORD)InterlockedCompareExchange(&g_last_input_tick, 0, 0);
-    if (cursor_available && IsRedrawEnabled() && GetTickCount() - last_input_tick <= MOTION_IDLE_MS) {
-        ScheduleNextRender();
-    } else {
-        StopRenderTimer();
+    LONG64 generation = InterlockedCompareExchange64(&g_input_generation, 0, 0);
+    if (generation == g_rendered_input_generation || !IsRedrawEnabled()) {
+        return;
+    }
+
+    bool cursor_available = SampleAndRenderCursor(false);
+    g_rendered_input_generation = generation;
+    g_last_motion_render_tick = GetTickCount();
+
+    LONG64 latest_generation = InterlockedCompareExchange64(&g_input_generation, 0, 0);
+    if (cursor_available && latest_generation != g_rendered_input_generation) {
+        ScheduleDirtyRender();
     }
 }
 
@@ -1898,6 +1887,7 @@ static void RequestCursorRender(void)
         InterlockedExchange64(&g_latest_input_qpc, input_time.QuadPart);
     }
     InterlockedExchange(&g_last_input_tick, (LONG)GetTickCount());
+    InterlockedIncrement64(&g_input_generation);
     InterlockedExchange(&g_render_requested, 1);
 
     if (g_render_wake_event) {
@@ -2436,18 +2426,44 @@ static void ProcessRenderWake(void)
     bool state_sync = InterlockedExchange(&g_state_sync_requested, 0) != 0;
     bool render_requested = InterlockedExchange(&g_render_requested, 0) != 0;
     bool force_render = InterlockedExchange(&g_force_render_requested, 0) != 0;
+    LONG64 generation = InterlockedCompareExchange64(&g_input_generation, 0, 0);
 
-    bool should_sample =
-        state_sync ||
-        (render_requested && IsRedrawEnabled() && (!g_render_timer_active || force_render));
-
-    if (should_sample) {
+    if (state_sync || force_render) {
         bool cursor_available = SampleAndRenderCursor(force_render);
+        g_rendered_input_generation = generation;
         if (!cursor_available) {
             StopRenderTimer();
-        } else if (render_requested && IsRedrawEnabled()) {
-            StartRenderTimer();
+        } else if (g_render_timer_active &&
+                   InterlockedCompareExchange64(&g_input_generation, 0, 0) ==
+                       g_rendered_input_generation) {
+            StopRenderTimer();
         }
+        return;
+    }
+
+    if (!render_requested || !IsRedrawEnabled() ||
+        generation == g_rendered_input_generation) {
+        return;
+    }
+
+    DWORD now_tick = GetTickCount();
+    if (g_last_motion_render_tick != 0 &&
+        now_tick - g_last_motion_render_tick <= MOTION_IDLE_MS) {
+        ScheduleDirtyRender();
+        return;
+    }
+
+    bool cursor_available = SampleAndRenderCursor(false);
+    g_rendered_input_generation = generation;
+    g_last_motion_render_tick = now_tick;
+    if (!cursor_available) {
+        StopRenderTimer();
+        return;
+    }
+
+    if (InterlockedCompareExchange64(&g_input_generation, 0, 0) !=
+        g_rendered_input_generation) {
+        ScheduleDirtyRender();
     }
 }
 

@@ -48,8 +48,8 @@ DrawCursor 是一个纯 Win32 C 编写的 Windows 小工具。它通过置顶、
 - 渲染线程动态加入 MMCSS `Capture`；不可用时安全回退到 Above Normal，不使用实时优先级。
 - 运动帧只调用一次 `GetCursorInfo`，同时获得最新屏幕坐标、显隐和光标句柄。样式变化会在同一帧重建 alpha/单色光标缓存。
 - 使用高精度 waitable timer；旧系统或高精度标志不可用时回退到普通 waitable timer，不再使用低优先级 `WM_TIMER` 驱动运动渲染。
-- 动态读取 DWM composition timing。连续运动的最大调度间隔为 `min(4ms, 刷新周期/2)`，并在不晚于该上限的前提下尝试靠近下一合成相位。DWM 查询失败或数据异常时安全回退到 4ms。
-- 一次性 timer 使用绝对 QPC deadline 计算，避免每次提交耗时累积成周期漂移。运动停止约 20ms 后关闭高频调度；50ms timer 只做闲置状态兜底和日志快照。
+- 动态读取 DWM composition timing。静止后的首次真实位移立即呈现；持续运动使用输入代次脏标记合并，只在下一合成帧的安全提交相位读取最新位置。DWM 查询失败或数据异常时安全回退到最长 4ms 的单次脏提交。
+- 一次性 timer 使用绝对 QPC deadline 计算，避免提交耗时累积成周期漂移。没有新位移时不继续周期唤醒；timer 等待期间到达的多个输入会替换为最新代次，50ms timer 只做光标形状、显隐状态兜底和日志快照。
 - `UpdateLayeredWindow` 的目标 DC 为 `NULL`，热路径不再每帧 `GetDC(NULL)`。
 - 默认关闭完整逐帧 Profiling，热路径不会执行其 QPC 采样、原子聚合和日志写入；明确启用后，主线程每秒只提交内存快照，后台线程批量写盘，退出时才强制 flush。
 - 覆盖窗口启用 per-monitor DPI awareness、置顶、点击穿透和非激活样式；使用 32-bit premultiplied alpha。对于 I-beam、Cross 等无法由 alpha 直接表达的 XOR-only 光标，会转换为黑色主体加白色一像素轮廓，保证在亮色和暗色背景上都可见。
@@ -81,7 +81,7 @@ build\logs\drawcursor-profile.csv
 
 ### 如何解读
 
-- 首先看 `input_to_render_*`。它反映输入消息、线程唤醒和调度等待的综合软件延迟；持续运动时平均值应明显低于 4ms。偶发最大值需要结合系统抢占和下一项判断。
+- 首先看 `input_to_render_*`。它反映输入消息、线程唤醒和相位调度等待的综合软件延迟；静止后首次位移应立即处理，持续运动则会有意等待下一帧安全提交相位，因此应结合显示刷新周期判断。偶发最大值需要结合系统抢占和下一项判断。
 - `deadline_late_*` 是 waitable timer 相对目标 QPC deadline 的迟到量。它持续偏高通常说明 CPU 调度、电源策略或其他高优先级负载干扰。
 - `update_layered_*` 只测量 `UpdateLayeredWindow` API 调用返回前的时间；`render_total_*` 测量一次实际呈现路径，但 `GetCursorInfo` 单独统计。
 - `refresh_period_avg_us` 可换算刷新率：`Hz ≈ 1,000,000 / refresh_period_avg_us`。`dwm_timing_fail` 增加时，本区间使用 4ms 回退预算。
@@ -105,7 +105,7 @@ build\logs\drawcursor-profile.csv
 2. 固定远程软件的采集帧率、编码器、网络和远端刷新率，分别测试静止后起步、匀速运动、快速变向、窗口边缘和不同光标样式。
 3. 检查极速模式是否出现遗漏、跳跃或残影；存在任何不稳定就以兼容模式作为验收模式。
 
-建议的软件侧目标是：持续运动时 `input_to_render_avg_us < 3000`、`deadline_late_avg_us < 1000`，`update_layered_avg_us` 稳定低于 1ms，且没有周期性的 10ms 以上长尾。最终体验目标应以端到端数据为准：本机重绘通常不超过一个显示刷新周期，远程结果则另外受采集和传输链路限制。
+建议的软件侧目标是：持续运动时 `input_to_render_avg_us` 不超过一个显示刷新周期、`deadline_late_avg_us < 1000`，`update_layered_avg_us` 稳定低于 1ms，且 `render_noop_same_pos` 接近零。最终体验目标应以端到端数据为准：本机重绘通常不超过一个显示刷新周期，远程结果则另外受采集和传输链路限制。
 
 ## 仓库外的更低延迟方案
 
