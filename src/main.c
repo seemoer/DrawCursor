@@ -2298,6 +2298,9 @@ static bool CreateRenderTimer(void)
 
     if (!g_render_timer) {
         g_render_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+        if (g_render_timer) {
+            BeginTimerPrecision();
+        }
     }
     return g_render_timer != NULL;
 }
@@ -2512,7 +2515,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
     g_instance = instance;
     SetBestDpiAwareness();
     SetLatencyPriority();
-    BeginTimerPrecision();
     ProfileInit();
 
     if (!RegisterWindowClasses()) {
