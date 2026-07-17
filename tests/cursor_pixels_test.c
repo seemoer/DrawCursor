@@ -7,6 +7,48 @@ typedef struct CursorTestCase {
     bool expect_high_contrast;
 } CursorTestCase;
 
+static bool TestCanvasSizing(void)
+{
+    g_cursor.width = 48;
+    g_cursor.height = 48;
+    g_cursor.hotspot_x = 4;
+    g_cursor.hotspot_y = 4;
+    g_compat_canvas_size = CURSOR_CANVAS_SIZE_DEFAULT;
+    if (CursorCanvasSize() != CURSOR_CANVAS_SIZE_DEFAULT) {
+        fprintf(stderr, "default canvas size changed unexpectedly\n");
+        return false;
+    }
+
+    g_compat_canvas_size = CURSOR_CANVAS_SIZE_EXPERIMENTAL;
+    if (CursorCanvasSize() != CURSOR_CANVAS_SIZE_EXPERIMENTAL) {
+        fprintf(stderr, "experimental canvas size was not selected\n");
+        return false;
+    }
+
+    g_cursor.width = 300;
+    g_cursor.height = 50;
+    g_cursor.hotspot_x = 0;
+    g_cursor.hotspot_y = 25;
+    int required = CursorCanvasSize();
+    POINT position = {1000, 500};
+    g_overlay_visible = true;
+    g_canvas_w = required;
+    g_canvas_h = required;
+    g_canvas_x = position.x - required / 2;
+    g_canvas_y = position.y - required / 2;
+    bool fits = CursorFitsCanvas(position);
+    g_overlay_visible = false;
+    g_canvas_w = 0;
+    g_canvas_h = 0;
+    if (required < (300 + CURSOR_CANVAS_MARGIN) * 2 || !fits) {
+        fprintf(stderr, "asymmetric hotspot is not safely contained\n");
+        return false;
+    }
+
+    printf("Canvas: default 384, experimental 256, asymmetric hotspot safe\n");
+    return true;
+}
+
 static bool TestSystemCursor(CursorTestCase test)
 {
     HCURSOR cursor = LoadCursorW(NULL, test.resource);
@@ -78,6 +120,7 @@ int main(void)
     };
 
     bool ok = true;
+    ok = TestCanvasSizing() && ok;
     for (size_t i = 0; i < ARRAYSIZE(tests); ++i) {
         if (!TestSystemCursor(tests[i])) {
             ok = false;

@@ -25,7 +25,8 @@
 #define TIMER_INTERVAL_MS 50
 #define RENDER_INTERVAL_MS 4
 #define MOTION_IDLE_MS 20
-#define CURSOR_CANVAS_SIZE 384
+#define CURSOR_CANVAS_SIZE_DEFAULT 384
+#define CURSOR_CANVAS_SIZE_EXPERIMENTAL 256
 #define CURSOR_CANVAS_MARGIN 32
 
 #define IDM_ENABLE 1001
@@ -187,6 +188,7 @@ static LARGE_INTEGER g_profile_start_time;
 static LARGE_INTEGER g_profile_last_snapshot_time;
 static ProfileStats g_profile;
 static bool g_profile_enabled = false;
+static int g_compat_canvas_size = CURSOR_CANVAS_SIZE_DEFAULT;
 static volatile LONG64 g_latest_input_qpc = 0;
 static HMODULE g_dwmapi;
 static DwmGetCompositionTimingInfoFn g_dwm_get_timing;
@@ -224,6 +226,10 @@ static void ConfigureRuntimeOptions(void)
     if (length > 0 && length < ARRAYSIZE(value)) {
         g_profile_enabled = IsEnabledEnvironmentValue(value);
     }
+    length = GetEnvironmentVariableW(L"DRAWCURSOR_CANVAS_SIZE", value, ARRAYSIZE(value));
+    if (length > 0 && length < ARRAYSIZE(value) && lstrcmpW(value, L"256") == 0) {
+        g_compat_canvas_size = CURSOR_CANVAS_SIZE_EXPERIMENTAL;
+    }
 
     int argument_count = 0;
     LPWSTR *arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
@@ -235,6 +241,10 @@ static void ConfigureRuntimeOptions(void)
             g_profile_enabled = true;
         } else if (lstrcmpiW(arguments[i], L"--no-profile") == 0) {
             g_profile_enabled = false;
+        } else if (lstrcmpiW(arguments[i], L"--canvas-256") == 0) {
+            g_compat_canvas_size = CURSOR_CANVAS_SIZE_EXPERIMENTAL;
+        } else if (lstrcmpiW(arguments[i], L"--canvas-384") == 0) {
+            g_compat_canvas_size = CURSOR_CANVAS_SIZE_DEFAULT;
         }
     }
     LocalFree(arguments);
@@ -1278,8 +1288,11 @@ static bool EnsureCanvasResources(int width, int height)
 
 static int CursorCanvasSize(void)
 {
-    int min_size = MaxInt(g_cursor.width, g_cursor.height) + CURSOR_CANVAS_MARGIN * 2;
-    return MaxInt(CURSOR_CANVAS_SIZE, min_size);
+    int horizontal_extent = MaxInt(g_cursor.hotspot_x, g_cursor.width - g_cursor.hotspot_x);
+    int vertical_extent = MaxInt(g_cursor.hotspot_y, g_cursor.height - g_cursor.hotspot_y);
+    int max_extent = MaxInt(horizontal_extent, vertical_extent);
+    int min_size = (max_extent + CURSOR_CANVAS_MARGIN) * 2;
+    return MaxInt(g_compat_canvas_size, min_size);
 }
 
 static bool CursorFitsCanvas(POINT cursor_pos)

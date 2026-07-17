@@ -90,7 +90,7 @@ try {
         throw "default mode unexpectedly created a full profiling CSV"
     }
 
-    $Process = Start-Process -FilePath $Executable -ArgumentList "--profile" -PassThru -WindowStyle Hidden
+    $Process = Start-Process -FilePath $Executable -ArgumentList "--profile --canvas-256" -PassThru -WindowStyle Hidden
     try {
         $Window = [IntPtr]::Zero
         for ($attempt = 0; $attempt -lt 30; ++$attempt) {
