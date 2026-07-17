@@ -43,7 +43,7 @@ DrawCursor 是一个纯 Win32 C 编写的 Windows 小工具。它通过置顶、
 
 ## 低延迟架构
 
-- 主线程只负责 Raw Input、托盘和低频闲置检查。它读取当前 `HRAWINPUT` 后用 `GetRawInputBuffer` 排空积压消息，把一批输入合并成一次“最新状态已变更”通知，不排队旧位置。
+- 主线程只负责 Raw Input、托盘和低频闲置检查。它读取当前 `HRAWINPUT` 后用 `GetRawInputBuffer` 排空积压消息，把一批输入合并成一次“最新状态已变更”通知，不排队旧位置。相对移动仅在坐标增量非零时唤醒渲染，绝对移动报告也会正确触发；纯按键和滚轮包不会启动位置渲染。
 - 独立渲染线程拥有 overlay HWND、全部 GDI 位图和 `UpdateLayeredWindow`。输入线程不会因分层窗口提交阻塞。
 - 渲染线程动态加入 MMCSS `Capture`；不可用时安全回退到 Above Normal，不使用实时优先级。
 - 运动帧只调用一次 `GetCursorInfo`，同时获得最新屏幕坐标、显隐和光标句柄。样式变化会在同一帧重建 alpha/单色光标缓存。

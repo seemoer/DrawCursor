@@ -1948,7 +1948,15 @@ static void ReleaseRawInputBuffer(void)
     g_raw_input_buffer_disabled = false;
 }
 
-static bool ReadCurrentRawMouse(HRAWINPUT input_handle, bool *is_mouse)
+static bool RawMouseHasMovement(const RAWMOUSE *mouse)
+{
+    if (mouse->usFlags & MOUSE_MOVE_ABSOLUTE) {
+        return true;
+    }
+    return mouse->lLastX != 0 || mouse->lLastY != 0;
+}
+
+static bool ReadCurrentRawMouse(HRAWINPUT input_handle, bool *is_mouse, bool *has_movement)
 {
     RAWINPUT input;
     UINT size = sizeof(input);
@@ -1963,6 +1971,7 @@ static bool ReadCurrentRawMouse(HRAWINPUT input_handle, bool *is_mouse)
     }
 
     *is_mouse = input.header.dwType == RIM_TYPEMOUSE;
+    *has_movement = *is_mouse && RawMouseHasMovement(&input.data.mouse);
     return true;
 }
 
@@ -1973,19 +1982,24 @@ static PRAWINPUT NextRawInputBlockAligned(PRAWINPUT input)
     return (PRAWINPUT)next;
 }
 
-static UINT DrainBufferedRawMouseInputs(bool *failed)
+typedef struct RawInputBatchStats {
+    UINT mouse_events;
+    UINT movement_events;
+} RawInputBatchStats;
+
+static RawInputBatchStats DrainBufferedRawMouseInputs(bool *failed)
 {
+    RawInputBatchStats stats = {0};
     *failed = false;
     if (g_raw_input_buffer_disabled) {
         *failed = true;
-        return 0;
+        return stats;
     }
     if (!g_raw_input_buffer && !ResizeRawInputBuffer(0)) {
         *failed = true;
-        return 0;
+        return stats;
     }
 
-    UINT mouse_events = 0;
     for (;;) {
         UINT buffer_size = g_raw_input_buffer_size;
         UINT count = GetRawInputBuffer(
@@ -2001,16 +2015,19 @@ static UINT DrainBufferedRawMouseInputs(bool *failed)
                 continue;
             }
             *failed = true;
-            return mouse_events;
+            return stats;
         }
         if (count == 0) {
-            return mouse_events;
+            return stats;
         }
 
         PRAWINPUT input = (PRAWINPUT)g_raw_input_buffer;
         for (UINT i = 0; i < count; ++i) {
             if (input->header.dwType == RIM_TYPEMOUSE) {
-                ++mouse_events;
+                ++stats.mouse_events;
+                if (RawMouseHasMovement(&input->data.mouse)) {
+                    ++stats.movement_events;
+                }
             }
 
             PRAWINPUT input_for_default = input;
@@ -2023,10 +2040,15 @@ static UINT DrainBufferedRawMouseInputs(bool *failed)
 static LRESULT ProcessRawInputMessage(HWND hwnd, WPARAM wparam, LPARAM lparam)
 {
     bool current_is_mouse = false;
-    bool current_read = ReadCurrentRawMouse((HRAWINPUT)lparam, &current_is_mouse);
+    bool current_has_movement = false;
+    bool current_read = ReadCurrentRawMouse(
+        (HRAWINPUT)lparam,
+        &current_is_mouse,
+        &current_has_movement);
     if (!current_read) {
         PROFILE_INC(g_profile.input_buffer_failures);
         current_is_mouse = true;
+        current_has_movement = true;
     }
 
 #ifdef DRAWCURSOR_RAW_INPUT_TEST_HOLD_MS
@@ -2034,12 +2056,14 @@ static LRESULT ProcessRawInputMessage(HWND hwnd, WPARAM wparam, LPARAM lparam)
 #endif
 
     bool buffer_failed = false;
-    UINT buffered_events = DrainBufferedRawMouseInputs(&buffer_failed);
+    RawInputBatchStats buffered = DrainBufferedRawMouseInputs(&buffer_failed);
     if (buffer_failed) {
         PROFILE_INC(g_profile.input_buffer_failures);
     }
 
+    UINT buffered_events = buffered.mouse_events;
     UINT total_events = (current_is_mouse ? 1U : 0U) + buffered_events;
+    UINT movement_events = (current_has_movement ? 1U : 0U) + buffered.movement_events;
     if (total_events > 0) {
         PROFILE_ADD(g_profile.input_events, total_events);
         PROFILE_INC(g_profile.input_batches);
@@ -2047,7 +2071,7 @@ static LRESULT ProcessRawInputMessage(HWND hwnd, WPARAM wparam, LPARAM lparam)
         if (total_events > 1) {
             PROFILE_ADD(g_profile.input_coalesced, total_events - 1);
         }
-        if (IsRedrawEnabled()) {
+        if (movement_events > 0 && IsRedrawEnabled()) {
             RequestCursorRender();
         }
     }
