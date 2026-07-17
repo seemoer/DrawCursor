@@ -33,7 +33,7 @@ DrawCursor 是一个纯 Win32 C 编写的 Windows 小工具。它通过置顶、
 
 输出文件为 `build\DrawCursor.exe`，无额外运行时依赖。
 
-完整的本地基础验证会执行 `-Werror` 静态语法检查、正式构建、短暂启动/正常退出，并核对 profiling CSV 的字段数：
+完整的本地基础验证会执行 `-Werror` 静态语法检查、正式构建、短暂启动/正常退出，确认默认轻量模式不创建日志，并核对按需 profiling CSV 的字段数：
 
 ```powershell
 .\verify.ps1
@@ -51,12 +51,19 @@ DrawCursor 是一个纯 Win32 C 编写的 Windows 小工具。它通过置顶、
 - 动态读取 DWM composition timing。连续运动的最大调度间隔为 `min(4ms, 刷新周期/2)`，并在不晚于该上限的前提下尝试靠近下一合成相位。DWM 查询失败或数据异常时安全回退到 4ms。
 - 一次性 timer 使用绝对 QPC deadline 计算，避免每次提交耗时累积成周期漂移。运动停止约 20ms 后关闭高频调度；50ms timer 只做闲置状态兜底和日志快照。
 - `UpdateLayeredWindow` 的目标 DC 为 `NULL`，热路径不再每帧 `GetDC(NULL)`。
-- Profiling 统计使用原子聚合；主线程每秒只提交内存快照，后台线程批量写盘，退出时才强制 flush。
+- 默认关闭完整逐帧 Profiling，热路径不会执行其 QPC 采样、原子聚合和日志写入；明确启用后，主线程每秒只提交内存快照，后台线程批量写盘，退出时才强制 flush。
 - 覆盖窗口启用 per-monitor DPI awareness、置顶、点击穿透和非激活样式；使用 32-bit premultiplied alpha。对于 I-beam、Cross 等无法由 alpha 直接表达的 XOR-only 光标，会转换为黑色主体加白色一像素轮廓，保证在亮色和暗色背景上都可见。
 
 ## Profiling
 
-程序运行时写入：
+完整 Profiling 默认关闭。需要测量时使用任一种方式启动：
+
+```powershell
+.\build\DrawCursor.exe --profile
+$env:DRAWCURSOR_PROFILE = "1"; .\build\DrawCursor.exe
+```
+
+命令行 `--no-profile` 可覆盖环境变量并关闭分析。启用后写入：
 
 ```text
 build\logs\drawcursor-profile.csv

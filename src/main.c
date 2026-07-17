@@ -118,8 +118,8 @@ typedef struct ProfileRow {
 } ProfileRow;
 
 #define PROFILE_QUEUE_CAPACITY 16
-#define PROFILE_INC(field) InterlockedIncrement64(&(field))
-#define PROFILE_ADD(field, value) InterlockedAdd64(&(field), (LONG64)(value))
+#define PROFILE_INC(field) do { if (g_profile_enabled) InterlockedIncrement64(&(field)); } while (0)
+#define PROFILE_ADD(field, value) do { if (g_profile_enabled) InterlockedAdd64(&(field), (LONG64)(value)); } while (0)
 
 typedef struct BitmapInfo1bpp {
     BITMAPINFOHEADER bmiHeader;
@@ -183,6 +183,7 @@ static LARGE_INTEGER g_qpc_frequency;
 static LARGE_INTEGER g_profile_start_time;
 static LARGE_INTEGER g_profile_last_snapshot_time;
 static ProfileStats g_profile;
+static bool g_profile_enabled = false;
 static volatile LONG64 g_latest_input_qpc = 0;
 static HMODULE g_dwmapi;
 static DwmGetCompositionTimingInfoFn g_dwm_get_timing;
@@ -203,6 +204,38 @@ static void ReleaseCursorBitmapResources(void);
 static bool IsRedrawEnabled(void)
 {
     return InterlockedCompareExchange(&g_redraw_enabled, 0, 0) != 0;
+}
+
+static bool IsEnabledEnvironmentValue(const WCHAR *value)
+{
+    return value &&
+           (lstrcmpiW(value, L"1") == 0 ||
+            lstrcmpiW(value, L"true") == 0 ||
+            lstrcmpiW(value, L"on") == 0 ||
+            lstrcmpiW(value, L"yes") == 0);
+}
+
+static void ConfigureRuntimeOptions(void)
+{
+    WCHAR value[16];
+    DWORD length = GetEnvironmentVariableW(L"DRAWCURSOR_PROFILE", value, ARRAYSIZE(value));
+    if (length > 0 && length < ARRAYSIZE(value)) {
+        g_profile_enabled = IsEnabledEnvironmentValue(value);
+    }
+
+    int argument_count = 0;
+    LPWSTR *arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+    if (!arguments) {
+        return;
+    }
+    for (int i = 1; i < argument_count; ++i) {
+        if (lstrcmpiW(arguments[i], L"--profile") == 0) {
+            g_profile_enabled = true;
+        } else if (lstrcmpiW(arguments[i], L"--no-profile") == 0) {
+            g_profile_enabled = false;
+        }
+    }
+    LocalFree(arguments);
 }
 
 static void SetLatencyPriority(void)
@@ -253,11 +286,17 @@ static void EndTimerPrecision(void)
     }
 }
 
-static LARGE_INTEGER ProfileNow(void)
+static LARGE_INTEGER QpcNow(void)
 {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return now;
+}
+
+static LARGE_INTEGER ProfileTimestamp(void)
+{
+    LARGE_INTEGER now = {0};
+    return g_profile_enabled ? QpcNow() : now;
 }
 
 static ULONGLONG ProfileElapsedUs(LARGE_INTEGER start, LARGE_INTEGER end)
@@ -271,6 +310,9 @@ static ULONGLONG ProfileElapsedUs(LARGE_INTEGER start, LARGE_INTEGER end)
 
 static void ProfileAddValue(DurationStats *stats, ULONGLONG value_us)
 {
+    if (!g_profile_enabled) {
+        return;
+    }
     LONG64 elapsed_us = (LONG64)value_us;
     PROFILE_INC(stats->count);
     InterlockedAdd64(&stats->total_us, elapsed_us);
@@ -477,7 +519,7 @@ static void ProfileQueueSnapshot(bool force)
         return;
     }
 
-    LARGE_INTEGER now = ProfileNow();
+    LARGE_INTEGER now = QpcNow();
     ULONGLONG interval_us = ProfileElapsedUs(g_profile_last_snapshot_time, now);
     if (!force && interval_us < 1000000ULL) {
         return;
@@ -505,7 +547,11 @@ static void ProfileQueueSnapshot(bool force)
 static void ProfileInit(void)
 {
     QueryPerformanceFrequency(&g_qpc_frequency);
-    g_profile_start_time = ProfileNow();
+    if (!g_profile_enabled) {
+        return;
+    }
+
+    g_profile_start_time = QpcNow();
     g_profile_last_snapshot_time = g_profile_start_time;
 
     WCHAR path[MAX_PATH];
@@ -1254,7 +1300,7 @@ static bool CursorFitsCanvas(POINT cursor_pos)
 
 static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
 {
-    LARGE_INTEGER render_start = ProfileNow();
+    LARGE_INTEGER render_start = ProfileTimestamp();
     PROFILE_INC(g_profile.render_attempts);
     if (force_update) {
         PROFILE_INC(g_profile.render_force);
@@ -1262,14 +1308,14 @@ static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
 
     if (!IsRedrawEnabled() || !g_overlay_hwnd || !g_cursor_showing || !g_cursor.handle) {
         PROFILE_INC(g_profile.render_fail);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
         return false;
     }
 
     int canvas_size = CursorCanvasSize();
     if (!EnsureCanvasResources(canvas_size, canvas_size) || !EnsureCursorBitmapResources()) {
         PROFILE_INC(g_profile.render_fail);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
         return false;
     }
 
@@ -1291,25 +1337,25 @@ static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
         cursor_pos.x == g_last_rendered_cursor_pos.x &&
         cursor_pos.y == g_last_rendered_cursor_pos.y) {
         PROFILE_INC(g_profile.render_noop_same_pos);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
         return true;
     }
 
-    LARGE_INTEGER step_start = ProfileNow();
+    LARGE_INTEGER step_start = ProfileTimestamp();
     if (force_update || !g_have_canvas_cursor_rect) {
         ZeroMemory(g_canvas_pixels, (size_t)g_canvas_w * (size_t)g_canvas_h * sizeof(DWORD));
     } else {
         ClearCanvasRect(g_last_canvas_cursor_rect);
     }
-    ProfileAddDuration(&g_profile.fill_canvas, step_start, ProfileNow());
+    ProfileAddDuration(&g_profile.fill_canvas, step_start, ProfileTimestamp());
 
     int image_x = cursor_pos.x - g_cursor.hotspot_x - g_canvas_x;
     int image_y = cursor_pos.y - g_cursor.hotspot_y - g_canvas_y;
 
-    step_start = ProfileNow();
+    step_start = ProfileTimestamp();
     RECT copied_rect;
     bool copied_cursor = CopyCursorToCanvas(image_x, image_y, &copied_rect);
-    ProfileAddDuration(&g_profile.draw_icon, step_start, ProfileNow());
+    ProfileAddDuration(&g_profile.draw_icon, step_start, ProfileTimestamp());
 
     g_have_canvas_cursor_rect = copied_cursor;
     if (copied_cursor) {
@@ -1321,7 +1367,7 @@ static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
     if (!CanvasPixelsStayInside(allowed)) {
         OutputDebugStringW(L"DrawCursor: canvas pixel escaped current cursor bounds\n");
         PROFILE_INC(g_profile.render_fail);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
         return false;
     }
 #endif
@@ -1335,7 +1381,7 @@ static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
 
-    step_start = ProfileNow();
+    step_start = ProfileTimestamp();
     BOOL ok = UpdateLayeredWindow(
         g_overlay_hwnd,
         NULL,
@@ -1346,13 +1392,13 @@ static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
         0,
         &blend,
         ULW_ALPHA);
-    LARGE_INTEGER update_end = ProfileNow();
+    LARGE_INTEGER update_end = ProfileTimestamp();
     ULONGLONG update_us = ProfileElapsedUs(step_start, update_end);
     ProfileAddValue(&g_profile.update_layered, update_us);
 
     if (!ok) {
         PROFILE_INC(g_profile.render_fail);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
         return false;
     }
 
@@ -1376,7 +1422,7 @@ static bool RenderCursorCompatibility(POINT cursor_pos, bool force_update)
     g_last_rendered_cursor_pos = cursor_pos;
     g_have_rendered_cursor = true;
     PROFILE_INC(g_profile.render_success);
-    ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+    ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
     return true;
 }
 
@@ -1391,13 +1437,13 @@ static bool FallbackToCompatibility(POINT cursor_pos, LARGE_INTEGER fast_render_
     if (g_main_hwnd) {
         PostMessageW(g_main_hwnd, WM_RENDER_MODE_FALLBACK, 0, 0);
     }
-    ProfileAddDuration(&g_profile.render_total, fast_render_start, ProfileNow());
+    ProfileAddDuration(&g_profile.render_total, fast_render_start, ProfileTimestamp());
     return RenderCursorCompatibility(cursor_pos, true);
 }
 
 static bool RenderCursorFast(POINT cursor_pos, bool force_update)
 {
-    LARGE_INTEGER render_start = ProfileNow();
+    LARGE_INTEGER render_start = ProfileTimestamp();
     PROFILE_INC(g_profile.render_attempts);
     if (force_update) {
         PROFILE_INC(g_profile.render_force);
@@ -1405,7 +1451,7 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
 
     if (!IsRedrawEnabled() || !g_overlay_hwnd || !g_cursor_showing || !g_cursor.handle) {
         PROFILE_INC(g_profile.render_fail);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
         return false;
     }
 
@@ -1425,12 +1471,12 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
         cursor_pos.x == g_last_rendered_cursor_pos.x &&
         cursor_pos.y == g_last_rendered_cursor_pos.y) {
         PROFILE_INC(g_profile.render_noop_same_pos);
-        ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+        ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
         return true;
     }
 
     if (!force_update && surface_ready && g_overlay_visible) {
-        LARGE_INTEGER move_start = ProfileNow();
+        LARGE_INTEGER move_start = ProfileTimestamp();
 #ifdef DRAWCURSOR_FAST_TEST_FAIL_POSITION
         BOOL moved = FALSE;
 #else
@@ -1446,7 +1492,7 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
             NULL,
             0);
 #endif
-        LARGE_INTEGER move_end = ProfileNow();
+        LARGE_INTEGER move_end = ProfileTimestamp();
         ProfileAddDuration(&g_profile.update_layered, move_start, move_end);
 
         if (moved) {
@@ -1457,7 +1503,7 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
             g_have_rendered_cursor = true;
             PROFILE_INC(g_profile.fast_move_success);
             PROFILE_INC(g_profile.render_success);
-            ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+            ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
             return true;
         }
 
@@ -1475,14 +1521,14 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
     }
 
     if (redraw_surface) {
-        LARGE_INTEGER fill_start = ProfileNow();
+        LARGE_INTEGER fill_start = ProfileTimestamp();
         ZeroMemory(g_canvas_pixels, (size_t)g_canvas_w * (size_t)g_canvas_h * sizeof(DWORD));
-        ProfileAddDuration(&g_profile.fill_canvas, fill_start, ProfileNow());
+        ProfileAddDuration(&g_profile.fill_canvas, fill_start, ProfileTimestamp());
 
-        LARGE_INTEGER draw_start = ProfileNow();
+        LARGE_INTEGER draw_start = ProfileTimestamp();
         RECT copied_rect;
         bool copied_cursor = CopyCursorToCanvas(0, 0, &copied_rect);
-        ProfileAddDuration(&g_profile.draw_icon, draw_start, ProfileNow());
+        ProfileAddDuration(&g_profile.draw_icon, draw_start, ProfileTimestamp());
         g_have_canvas_cursor_rect = copied_cursor;
         if (copied_cursor) {
             g_last_canvas_cursor_rect = copied_rect;
@@ -1510,7 +1556,7 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
 
-    LARGE_INTEGER update_start = ProfileNow();
+    LARGE_INTEGER update_start = ProfileTimestamp();
     BOOL updated = UpdateLayeredWindow(
         g_overlay_hwnd,
         NULL,
@@ -1521,7 +1567,7 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
         0,
         &blend,
         ULW_ALPHA);
-    LARGE_INTEGER update_end = ProfileNow();
+    LARGE_INTEGER update_end = ProfileTimestamp();
     ULONGLONG update_us = ProfileElapsedUs(update_start, update_end);
     ProfileAddValue(&g_profile.update_layered, update_us);
     if (!updated) {
@@ -1552,7 +1598,7 @@ static bool RenderCursorFast(POINT cursor_pos, bool force_update)
     g_have_rendered_cursor = true;
     PROFILE_INC(g_profile.fast_full_update);
     PROFILE_INC(g_profile.render_success);
-    ProfileAddDuration(&g_profile.render_total, render_start, ProfileNow());
+    ProfileAddDuration(&g_profile.render_total, render_start, ProfileTimestamp());
     return true;
 }
 
@@ -1566,7 +1612,7 @@ static bool RenderCursorForMode(POINT cursor_pos, bool force_update)
 
 static bool SampleAndRenderCursor(bool force_update)
 {
-    LARGE_INTEGER step_start = ProfileNow();
+    LARGE_INTEGER step_start = ProfileTimestamp();
     LONG64 input_qpc = InterlockedExchange64(&g_latest_input_qpc, 0);
     if (input_qpc > 0 && step_start.QuadPart >= input_qpc) {
         LARGE_INTEGER input_time;
@@ -1586,7 +1632,7 @@ static bool SampleAndRenderCursor(bool force_update)
     ZeroMemory(&cursor_info, sizeof(cursor_info));
     cursor_info.cbSize = sizeof(cursor_info);
     BOOL got_cursor = GetCursorInfo(&cursor_info);
-    ProfileAddDuration(&g_profile.get_cursor_info, step_start, ProfileNow());
+    ProfileAddDuration(&g_profile.get_cursor_info, step_start, ProfileTimestamp());
 
     if (!got_cursor ||
         !(cursor_info.flags & CURSOR_SHOWING) ||
@@ -1783,7 +1829,7 @@ static bool ArmRenderTimerDeadline(LONG64 deadline_qpc)
         return false;
     }
 
-    LARGE_INTEGER now = ProfileNow();
+    LARGE_INTEGER now = QpcNow();
     LONG64 remaining_qpc = deadline_qpc - now.QuadPart;
     LONGLONG remaining_100ns =
         remaining_qpc > 0
@@ -1810,7 +1856,7 @@ static bool ArmRenderTimerDeadline(LONG64 deadline_qpc)
 
 static bool ScheduleNextRender(void)
 {
-    LARGE_INTEGER now = ProfileNow();
+    LARGE_INTEGER now = QpcNow();
     return ArmRenderTimerDeadline(ComputeNextRenderDeadline(now.QuadPart));
 }
 
@@ -1828,7 +1874,7 @@ static void ProcessRenderTimer(void)
     }
 
     PROFILE_INC(g_profile.render_timer_ticks);
-    LARGE_INTEGER timer_fired = ProfileNow();
+    LARGE_INTEGER timer_fired = QpcNow();
     if (g_render_timer_deadline_qpc > 0 && timer_fired.QuadPart > g_render_timer_deadline_qpc) {
         LARGE_INTEGER deadline;
         deadline.QuadPart = g_render_timer_deadline_qpc;
@@ -1847,8 +1893,10 @@ static void ProcessRenderTimer(void)
 static void RequestCursorRender(void)
 {
     PROFILE_INC(g_profile.render_requests);
-    LARGE_INTEGER input_time = ProfileNow();
-    InterlockedExchange64(&g_latest_input_qpc, input_time.QuadPart);
+    if (g_profile_enabled) {
+        LARGE_INTEGER input_time = QpcNow();
+        InterlockedExchange64(&g_latest_input_qpc, input_time.QuadPart);
+    }
     InterlockedExchange(&g_last_input_tick, (LONG)GetTickCount());
     InterlockedExchange(&g_render_requested, 1);
 
@@ -2513,6 +2561,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
     }
 
     g_instance = instance;
+    ConfigureRuntimeOptions();
     SetBestDpiAwareness();
     SetLatencyPriority();
     ProfileInit();

@@ -71,7 +71,26 @@ if ($HadExistingProfile) {
 }
 
 try {
-    $Process = Start-Process -FilePath $Executable -PassThru -WindowStyle Hidden
+    $DefaultProcess = Start-Process -FilePath $Executable -PassThru -WindowStyle Hidden
+    try {
+        $DefaultWindow = [IntPtr]::Zero
+        for ($attempt = 0; $attempt -lt 30; ++$attempt) {
+            Start-Sleep -Milliseconds 50
+            $DefaultWindow = [DrawCursorVerifyNative]::FindWindow($ClassName, $WindowName)
+            if ($DefaultWindow -ne [IntPtr]::Zero) { break }
+        }
+        if ($DefaultWindow -eq [IntPtr]::Zero) { throw "DrawCursor default mode did not create its main window" }
+        [void][DrawCursorVerifyNative]::PostMessage($DefaultWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+        if (-not $DefaultProcess.WaitForExit(5000)) { throw "DrawCursor default mode did not exit" }
+    }
+    finally {
+        if (-not $DefaultProcess.HasExited) { Stop-Process -Id $DefaultProcess.Id -Force }
+    }
+    if (Test-Path -LiteralPath $Profile) {
+        throw "default mode unexpectedly created a full profiling CSV"
+    }
+
+    $Process = Start-Process -FilePath $Executable -ArgumentList "--profile" -PassThru -WindowStyle Hidden
     try {
         $Window = [IntPtr]::Zero
         for ($attempt = 0; $attempt -lt 30; ++$attempt) {
@@ -125,4 +144,4 @@ finally {
     }
 }
 
-Write-Host "Verification passed: syntax, build, cursor pixels, startup/shutdown, and $ExpectedColumns-column profiling CSV"
+Write-Host "Verification passed: syntax, build, cursor pixels, lightweight default, startup/shutdown, and opt-in $ExpectedColumns-column profiling CSV"
