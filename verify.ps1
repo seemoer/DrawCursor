@@ -2,6 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Source = Join-Path $Root "src\main.c"
+$CursorTestSource = Join-Path $Root "tests\cursor_pixels_test.c"
+$CursorTestExecutable = Join-Path $Root "build\cursor-pixels-test.exe"
 $Executable = Join-Path $Root "build\DrawCursor.exe"
 $Profile = Join-Path $Root "build\logs\drawcursor-profile.csv"
 $ExpectedColumns = 45
@@ -21,6 +23,26 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & (Join-Path $Root "build.ps1")
+
+& $Gcc `
+    $CursorTestSource `
+    -o $CursorTestExecutable `
+    -O2 `
+    -Wall `
+    -Wextra `
+    -Werror `
+    -finput-charset=UTF-8 `
+    -lshell32 `
+    -luser32 `
+    -lgdi32
+if ($LASTEXITCODE -ne 0) {
+    throw "cursor pixel test build failed with exit code $LASTEXITCODE"
+}
+
+& $CursorTestExecutable
+if ($LASTEXITCODE -ne 0) {
+    throw "cursor pixel test failed with exit code $LASTEXITCODE"
+}
 
 Add-Type -TypeDefinition @'
 using System;
@@ -103,4 +125,4 @@ finally {
     }
 }
 
-Write-Host "Verification passed: syntax, build, startup/shutdown, and $ExpectedColumns-column profiling CSV"
+Write-Host "Verification passed: syntax, build, cursor pixels, startup/shutdown, and $ExpectedColumns-column profiling CSV"

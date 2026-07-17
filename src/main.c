@@ -796,9 +796,59 @@ static bool GetMaskBit(const BYTE *bits, int stride, int x, int y)
     return (bits[y * stride + x / 8] & (BYTE)(0x80 >> (x % 8))) != 0;
 }
 
+static void ApplyHighContrastXorPixels(
+    DWORD *pixels,
+    const BYTE *xor_pixels,
+    int width,
+    int height)
+{
+    if (!pixels || !xor_pixels || width <= 0 || height <= 0) {
+        return;
+    }
+
+    /*
+     * Per-pixel alpha cannot represent the invert operation used by classic
+     * XOR cursors. Draw a white one-pixel outline around a black core so the
+     * cursor remains visible on both light and dark backgrounds.
+     */
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            if (!xor_pixels[y * width + x]) {
+                continue;
+            }
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                int outline_y = y + dy;
+                if (outline_y < 0 || outline_y >= height) {
+                    continue;
+                }
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int outline_x = x + dx;
+                    if (outline_x < 0 || outline_x >= width || (dx == 0 && dy == 0)) {
+                        continue;
+                    }
+
+                    int outline_index = outline_y * width + outline_x;
+                    if (!xor_pixels[outline_index] && pixels[outline_index] == 0) {
+                        pixels[outline_index] = 0xFFFFFFFF;
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < width * height; ++i) {
+        if (xor_pixels[i]) {
+            pixels[i] = 0xFF000000;
+        }
+    }
+}
+
 static void BuildCursorFromMonochromeMask(const BYTE *mask_bits, int mask_stride, int mask_height)
 {
     int xor_offset = mask_height >= g_cursor.height * 2 ? g_cursor.height : 0;
+    int pixel_count = g_cursor.width * g_cursor.height;
+    BYTE *xor_pixels = (BYTE *)calloc((size_t)pixel_count, sizeof(BYTE));
 
     for (int y = 0; y < g_cursor.height; ++y) {
         for (int x = 0; x < g_cursor.width; ++x) {
@@ -811,11 +861,24 @@ static void BuildCursorFromMonochromeMask(const BYTE *mask_bits, int mask_stride
             } else if (!and_bit && xor_bit) {
                 pixel = 0xFFFFFFFF;
             } else if (and_bit && xor_bit) {
-                pixel = 0xFF000000;
+                if (xor_pixels) {
+                    xor_pixels[y * g_cursor.width + x] = 1;
+                } else {
+                    pixel = 0xFF000000;
+                }
             }
 
             g_cursor_pixels[y * g_cursor.width + x] = pixel;
         }
+    }
+
+    if (xor_pixels) {
+        ApplyHighContrastXorPixels(
+            g_cursor_pixels,
+            xor_pixels,
+            g_cursor.width,
+            g_cursor.height);
+        free(xor_pixels);
     }
 }
 
@@ -858,6 +921,7 @@ static bool BuildCursorBitmapPixels(void)
             } else {
                 int mask_stride = 0;
                 BYTE *mask_bits = NULL;
+                BYTE *xor_pixels = (BYTE *)calloc((size_t)pixel_count, sizeof(BYTE));
                 BITMAP mask_bitmap;
                 ZeroMemory(&mask_bitmap, sizeof(mask_bitmap));
 
@@ -880,8 +944,25 @@ static bool BuildCursorBitmapPixels(void)
 
                         if (!transparent) {
                             g_cursor_pixels[i] = color_pixels[i] | 0xFF000000;
+                        } else if ((color_pixels[i] & 0x00FFFFFF) != 0) {
+                            /* Color cursors such as the system I-beam can put
+                             * all visible pixels in an XOR-only RGB bitmap. */
+                            if (xor_pixels) {
+                                xor_pixels[i] = 1;
+                            } else {
+                                g_cursor_pixels[i] = 0xFF000000;
+                            }
                         }
                     }
+                }
+
+                if (xor_pixels) {
+                    ApplyHighContrastXorPixels(
+                        g_cursor_pixels,
+                        xor_pixels,
+                        g_cursor.width,
+                        g_cursor.height);
+                    free(xor_pixels);
                 }
 
                 if (mask_bits) {

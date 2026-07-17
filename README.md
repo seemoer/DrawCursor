@@ -52,7 +52,7 @@ DrawCursor 是一个纯 Win32 C 编写的 Windows 小工具。它通过置顶、
 - 一次性 timer 使用绝对 QPC deadline 计算，避免每次提交耗时累积成周期漂移。运动停止约 20ms 后关闭高频调度；50ms timer 只做闲置状态兜底和日志快照。
 - `UpdateLayeredWindow` 的目标 DC 为 `NULL`，热路径不再每帧 `GetDC(NULL)`。
 - Profiling 统计使用原子聚合；主线程每秒只提交内存快照，后台线程批量写盘，退出时才强制 flush。
-- 覆盖窗口启用 per-monitor DPI awareness、置顶、点击穿透和非激活样式；使用 32-bit premultiplied alpha，兼容彩色、alpha、单色和 XOR 光标。
+- 覆盖窗口启用 per-monitor DPI awareness、置顶、点击穿透和非激活样式；使用 32-bit premultiplied alpha。对于 I-beam、Cross 等无法由 alpha 直接表达的 XOR-only 光标，会转换为黑色主体加白色一像素轮廓，保证在亮色和暗色背景上都可见。
 
 ## Profiling
 
