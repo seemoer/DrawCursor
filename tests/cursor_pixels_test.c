@@ -49,6 +49,29 @@ static bool TestCanvasSizing(void)
     return true;
 }
 
+static bool TestMenuPopupDepth(void)
+{
+    InterlockedExchange(&g_menu_popup_depth, 0);
+    MenuWinEventProc(NULL, EVENT_SYSTEM_MENUPOPUPSTART, NULL, 0, 0, 0, 0);
+    MenuWinEventProc(NULL, EVENT_SYSTEM_MENUPOPUPSTART, NULL, 0, 0, 0, 0);
+    MenuWinEventProc(NULL, EVENT_SYSTEM_MENUPOPUPEND, NULL, 0, 0, 0, 0);
+    if (InterlockedCompareExchange(&g_menu_popup_depth, 0, 0) != 1) {
+        fprintf(stderr, "nested menu depth was not retained\n");
+        return false;
+    }
+
+    MenuWinEventProc(NULL, EVENT_SYSTEM_MENUPOPUPEND, NULL, 0, 0, 0, 0);
+    MenuWinEventProc(NULL, EVENT_SYSTEM_MENUPOPUPEND, NULL, 0, 0, 0, 0);
+    if (InterlockedCompareExchange(&g_menu_popup_depth, 0, 0) != 0) {
+        fprintf(stderr, "menu depth underflowed\n");
+        return false;
+    }
+
+    InterlockedExchange(&g_state_sync_requested, 0);
+    printf("Menu popup: nested start/end depth safe\n");
+    return true;
+}
+
 static bool TestSystemCursor(CursorTestCase test)
 {
     HCURSOR cursor = LoadCursorW(NULL, test.resource);
@@ -121,6 +144,7 @@ int main(void)
 
     bool ok = true;
     ok = TestCanvasSizing() && ok;
+    ok = TestMenuPopupDepth() && ok;
     for (size_t i = 0; i < ARRAYSIZE(tests); ++i) {
         if (!TestSystemCursor(tests[i])) {
             ok = false;

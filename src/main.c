@@ -193,6 +193,8 @@ static volatile LONG64 g_latest_input_qpc = 0;
 static HMODULE g_dwmapi;
 static DwmGetCompositionTimingInfoFn g_dwm_get_timing;
 static bool g_dwm_timing_disabled = false;
+static HWINEVENTHOOK g_menu_event_hook;
+static volatile LONG g_menu_popup_depth = 0;
 static LONG64 g_refresh_period_qpc = 0;
 static LONG64 g_last_vblank_qpc = 0;
 static LONG64 g_last_dwm_query_qpc = 0;
@@ -208,6 +210,67 @@ static void ReleaseCursorBitmapResources(void);
 static bool IsRedrawEnabled(void)
 {
     return InterlockedCompareExchange(&g_redraw_enabled, 0, 0) != 0;
+}
+
+static void RequestCursorStateSync(void);
+
+static void CALLBACK MenuWinEventProc(
+    HWINEVENTHOOK hook,
+    DWORD event,
+    HWND hwnd,
+    LONG object_id,
+    LONG child_id,
+    DWORD event_thread,
+    DWORD event_time)
+{
+    (void)hook;
+    (void)hwnd;
+    (void)object_id;
+    (void)child_id;
+    (void)event_thread;
+    (void)event_time;
+
+    if (event == EVENT_SYSTEM_MENUPOPUPSTART) {
+        InterlockedIncrement(&g_menu_popup_depth);
+        RequestCursorStateSync();
+        return;
+    }
+    if (event != EVENT_SYSTEM_MENUPOPUPEND) {
+        return;
+    }
+
+    LONG depth = InterlockedCompareExchange(&g_menu_popup_depth, 0, 0);
+    while (depth > 0) {
+        LONG observed = InterlockedCompareExchange(
+            &g_menu_popup_depth,
+            depth - 1,
+            depth);
+        if (observed == depth) {
+            break;
+        }
+        depth = observed;
+    }
+}
+
+static void StartMenuEventHook(void)
+{
+    g_menu_event_hook = SetWinEventHook(
+        EVENT_SYSTEM_MENUPOPUPSTART,
+        EVENT_SYSTEM_MENUPOPUPEND,
+        NULL,
+        MenuWinEventProc,
+        0,
+        0,
+        WINEVENT_OUTOFCONTEXT);
+}
+
+static void StopMenuEventHook(void)
+{
+    if (g_menu_event_hook) {
+        UnhookWinEvent(g_menu_event_hook);
+        g_menu_event_hook = NULL;
+    }
+    InterlockedExchange(&g_menu_popup_depth, 0);
 }
 
 static bool IsEnabledEnvironmentValue(const WCHAR *value)
@@ -1625,6 +1688,23 @@ static bool RenderCursorForMode(POINT cursor_pos, bool force_update)
     return RenderCursorCompatibility(cursor_pos, force_update);
 }
 
+static void RaiseOverlayAboveActiveMenu(void)
+{
+    if (!g_overlay_hwnd || !g_overlay_visible ||
+        InterlockedCompareExchange(&g_menu_popup_depth, 0, 0) <= 0) {
+        return;
+    }
+
+    SetWindowPos(
+        g_overlay_hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW);
+}
+
 static bool SampleAndRenderCursor(bool force_update)
 {
     LARGE_INTEGER step_start = ProfileTimestamp();
@@ -1690,6 +1770,7 @@ static bool SampleAndRenderCursor(bool force_update)
         SetOverlayVisible(false);
         return false;
     }
+    RaiseOverlayAboveActiveMenu();
     return true;
 }
 
@@ -2658,6 +2739,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
         CloseHandle(mutex);
         return 1;
     }
+    StartMenuEventHook();
     RequestCursorStateSync();
 
     MSG message;
@@ -2667,6 +2749,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE previous_instance, LPWSTR co
         DispatchMessageW(&message);
     }
 
+    StopMenuEventHook();
     StopRenderThread();
     ProfileClose();
     EndTimerPrecision();

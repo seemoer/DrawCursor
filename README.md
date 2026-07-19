@@ -64,6 +64,7 @@ $env:DRAWCURSOR_CANVAS_SIZE = "256"; .\build\DrawCursor.exe
 - `UpdateLayeredWindow` 的目标 DC 为 `NULL`，热路径不再每帧 `GetDC(NULL)`。
 - 默认关闭完整逐帧 Profiling，热路径不会执行其 QPC 采样、原子聚合和日志写入；明确启用后，主线程每秒只提交内存快照，后台线程批量写盘，退出时才强制 flush。
 - 覆盖窗口启用 per-monitor DPI awareness、置顶、点击穿透和非激活样式；使用 32-bit premultiplied alpha。对于 I-beam、Cross 等无法由 alpha 直接表达的 XOR-only 光标，会转换为黑色主体加白色一像素轮廓，保证在亮色和暗色背景上都可见。
+- 监听系统菜单弹出事件；只有右键菜单、下拉菜单等弹出期间，才把透明覆盖窗重新提到菜单之上，避免菜单抢占顶层顺序后光标消失。
 
 ## Profiling
 
