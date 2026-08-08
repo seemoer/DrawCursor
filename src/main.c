@@ -1688,10 +1688,17 @@ static bool RenderCursorForMode(POINT cursor_pos, bool force_update)
     return RenderCursorCompatibility(cursor_pos, force_update);
 }
 
-static void RaiseOverlayAboveActiveMenu(void)
+static void KeepOverlayAtTop(void)
 {
-    if (!g_overlay_hwnd || !g_overlay_visible ||
-        InterlockedCompareExchange(&g_menu_popup_depth, 0, 0) <= 0) {
+    if (!g_overlay_hwnd || !g_overlay_visible) {
+        return;
+    }
+
+    /* TOPMOST is a group, not a permanent first position. A taskbar flyout or
+     * another topmost window created later can cover the cursor overlay. Avoid
+     * mutating the Z order on the normal path, but reclaim the first position
+     * whenever another window has actually moved above us. */
+    if (GetWindow(g_overlay_hwnd, GW_HWNDPREV) == NULL) {
         return;
     }
 
@@ -1770,7 +1777,7 @@ static bool SampleAndRenderCursor(bool force_update)
         SetOverlayVisible(false);
         return false;
     }
-    RaiseOverlayAboveActiveMenu();
+    KeepOverlayAtTop();
     return true;
 }
 
