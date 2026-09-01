@@ -8,7 +8,7 @@ DrawCursor 是一个 Windows 鼠标光标重绘工具。有些远程控制或录
 
 下载源码后，双击 `build.cmd`。
 
-第一次构建时，如果电脑里没有编译器，脚本会询问是否自动安装。输入 `Y`，它会通过 Windows 的 `winget` 安装 [MSYS2](https://www.msys2.org/) 和 GCC，然后继续构建。后面再用时不需要重复安装。
+脚本会先查找电脑里已有的 GCC。没有找到时，可以自动安装 [MSYS2](https://www.msys2.org/) 和 GCC，也可以选择一个已有的工具链目录。选择目录后，脚本会确认里面同时有 `gcc.exe` 和 `windres.exe`，再把它加入当前用户的环境变量。
 
 完成后，程序在这里：
 

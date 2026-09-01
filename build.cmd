@@ -7,7 +7,10 @@ set "NO_PAUSE="
 if /i "%~1"=="--no-pause" set "NO_PAUSE=1"
 
 call :find_tools
-if not defined GCC call :install_tools
+set "NEED_TOOLCHAIN="
+if not defined GCC set "NEED_TOOLCHAIN=1"
+if not defined WINDRES set "NEED_TOOLCHAIN=1"
+if defined NEED_TOOLCHAIN call :configure_tools
 if errorlevel 1 goto :failed
 
 call :find_tools
@@ -48,18 +51,63 @@ goto :finished
 :find_tools
 set "GCC="
 set "WINDRES="
-for /f "delims=" %%I in ('where gcc.exe 2^>nul') do if not defined GCC set "GCC=%%I"
-for /f "delims=" %%I in ('where windres.exe 2^>nul') do if not defined WINDRES set "WINDRES=%%I"
-if exist "C:\msys64\ucrt64\bin\gcc.exe" set "GCC=C:\msys64\ucrt64\bin\gcc.exe"
-if exist "C:\msys64\ucrt64\bin\windres.exe" set "WINDRES=C:\msys64\ucrt64\bin\windres.exe"
+for /f "delims=" %%I in ('where gcc.exe 2^>nul') do if not defined GCC if exist "%%~dpIwindres.exe" (
+    set "GCC=%%I"
+    set "WINDRES=%%~dpIwindres.exe"
+)
+if not defined GCC if exist "C:\msys64\ucrt64\bin\gcc.exe" if exist "C:\msys64\ucrt64\bin\windres.exe" (
+    set "GCC=C:\msys64\ucrt64\bin\gcc.exe"
+    set "WINDRES=C:\msys64\ucrt64\bin\windres.exe"
+)
+exit /b 0
+
+:configure_tools
+echo.
+echo No usable GCC toolchain was found.
+echo [1] Install MSYS2 and GCC automatically
+echo [2] Choose an existing toolchain folder
+echo [3] Cancel
+choice /c 123 /n /m "Select [1/2/3]: "
+if errorlevel 3 exit /b 1
+if errorlevel 2 goto :select_tools
+goto :install_tools
+
+:select_tools
+echo.
+echo Enter the bin folder that contains gcc.exe and windres.exe.
+echo You can also drag the folder into this window.
+set "SELECTED_TOOLCHAIN="
+set /p "SELECTED_TOOLCHAIN=Toolchain folder: "
+if not defined SELECTED_TOOLCHAIN exit /b 1
+set "SELECTED_TOOLCHAIN=%SELECTED_TOOLCHAIN:"=%"
+for %%I in ("%SELECTED_TOOLCHAIN%") do set "SELECTED_TOOLCHAIN=%%~fI"
+
+if not exist "%SELECTED_TOOLCHAIN%\gcc.exe" (
+    echo gcc.exe was not found in that folder.
+    exit /b 1
+)
+if not exist "%SELECTED_TOOLCHAIN%\windres.exe" (
+    echo windres.exe was not found in that folder.
+    exit /b 1
+)
+
+call :add_user_path
+if errorlevel 1 exit /b 1
+set "PATH=%SELECTED_TOOLCHAIN%;%PATH%"
+echo Toolchain is ready and available through PATH.
+exit /b 0
+
+:add_user_path
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p=[IO.Path]::GetFullPath($env:SELECTED_TOOLCHAIN).TrimEnd('\'); $u=[Environment]::GetEnvironmentVariable('Path','User'); $m=[Environment]::GetEnvironmentVariable('Path','Machine'); $items=@(($u+';'+$m) -split ';' | ForEach-Object { $_.Trim().TrimEnd('\') }); if ($items -notcontains $p) { $new=if ([string]::IsNullOrWhiteSpace($u)) { $p } else { $u.TrimEnd(';')+';'+$p }; [Environment]::SetEnvironmentVariable('Path',$new,'User') }"
+if errorlevel 1 (
+    echo Could not update the current user's PATH.
+    exit /b 1
+)
 exit /b 0
 
 :install_tools
 echo.
-echo A C compiler is required to build DrawCursor.
-echo This script can install MSYS2 and its UCRT64 GCC toolchain with winget.
-choice /c YN /n /m "Install it now? [Y/N]: "
-if errorlevel 2 exit /b 1
+echo Installing MSYS2 and its UCRT64 GCC toolchain...
 
 if not exist "C:\msys64\usr\bin\bash.exe" (
     where winget.exe >nul 2>nul
