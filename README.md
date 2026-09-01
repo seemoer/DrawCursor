@@ -1,34 +1,19 @@
 # DrawCursor
 
-DrawCursor 是一个 Windows 鼠标光标重绘工具。它会在系统光标位置额外绘制一份光标，帮助远程控制、桌面采集和录屏软件正确捕获鼠标。
+DrawCursor 是一个 Windows 鼠标光标重绘工具。有些远程控制或录屏软件抓不到系统光标，它会在原来的位置补画一份，让鼠标能正常出现在画面里。
 
 程序没有普通窗口，运行后显示在系统托盘。右键托盘图标可以打开或关闭重绘、切换兼容模式与极速模式，以及退出程序。
 
 ## 构建
 
-需要 64 位 MinGW-w64，并确保 `gcc` 和 `windres` 已加入系统 `PATH`：
+下载源码后，双击 `build.cmd`。
 
-```powershell
-gcc --version
-windres --version
+第一次构建时，如果电脑里没有编译器，脚本会询问是否自动安装。输入 `Y`，它会通过 Windows 的 `winget` 安装 [MSYS2](https://www.msys2.org/) 和 GCC，然后继续构建。后面再用时不需要重复安装。
+
+完成后，程序在这里：
+
 ```
-
-在项目目录运行：
-
-```powershell
-.\build.ps1
-```
-
-构建结果位于：
-
-```text
 build\DrawCursor.exe
 ```
 
-生成的 exe 已嵌入图标、manifest 和版本信息，可以单独复制运行。
-
-## 仓库外的更低延迟方案
-
-普通分层窗口仍属于 DWM 合成内容，无法获得系统硬件光标的独立扫描路径。如果可以修改桌面采集或远程控制端，更低延迟的架构是读取 Desktop Duplication/DXGI frame 中的 pointer position 和 pointer shape metadata，在编码端或远端客户端通过独立光标通道绘制。这样光标不必等待桌面视频帧更新。
-
-本仓库只包含覆盖层工具，没有采集端、编码器或远端客户端源码，因此无法在这里实现或验证该独立光标通道。
+这个 exe 可以单独复制到其他电脑，不需要再带上源码或图标文件。
