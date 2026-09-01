@@ -44,6 +44,8 @@ $env:DRAWCURSOR_CANVAS_SIZE = "256"; .\build\DrawCursor.exe
 
 输出文件为 `build\DrawCursor.exe`，无额外运行时依赖。
 
+第一次配置构建环境、从 GitHub 拉取源码或制作 Release 时，请参阅 [BUILD.md](BUILD.md)。
+
 完整的本地基础验证会执行 `-Werror` 静态语法检查、正式构建、短暂启动/正常退出，确认默认轻量模式不创建日志，并核对按需 profiling CSV 的字段数：
 
 ```powershell
