@@ -4,7 +4,7 @@
 typedef struct CursorTestCase {
     LPCWSTR resource;
     const char *name;
-    bool expect_high_contrast;
+    bool expect_xor_safe;
 } CursorTestCase;
 
 static bool TestCanvasSizing(void)
@@ -89,6 +89,7 @@ static bool TestSystemCursor(CursorTestCase test)
     int visible = 0;
     int black = 0;
     int white = 0;
+    int xor_safe = 0;
     int pixel_count = g_cursor_bitmap_w * g_cursor_bitmap_h;
     for (int i = 0; i < pixel_count; ++i) {
         DWORD pixel = g_cursor_pixels[i];
@@ -100,6 +101,8 @@ static bool TestSystemCursor(CursorTestCase test)
             ++black;
         } else if (pixel == 0xFFFFFFFF) {
             ++white;
+        } else if (pixel == XOR_CURSOR_CORE_PIXEL) {
+            ++xor_safe;
         }
     }
 
@@ -107,24 +110,31 @@ static bool TestSystemCursor(CursorTestCase test)
         fprintf(stderr, "%s: converted cursor is fully transparent\n", test.name);
         return false;
     }
-    if (test.expect_high_contrast && (black == 0 || white == 0)) {
+    if (test.expect_xor_safe && (xor_safe == 0 || white == 0)) {
         fprintf(
             stderr,
-            "%s: XOR cursor lacks black core or white outline (%d black, %d white)\n",
+            "%s: XOR cursor lacks neutral core or white outline (%d neutral, %d white)\n",
             test.name,
-            black,
+            xor_safe,
             white);
         return false;
     }
 
+    DWORD inverted_core = XOR_CURSOR_CORE_PIXEL ^ 0x00FFFFFF;
+    if (test.expect_xor_safe && inverted_core != 0xFF808080) {
+        fprintf(stderr, "%s: XOR-safe core is not inversion-stable\n", test.name);
+        return false;
+    }
+
     printf(
-        "%s: %dx%d, %d visible, %d black, %d white\n",
+        "%s: %dx%d, %d visible, %d black, %d white, %d neutral\n",
         test.name,
         g_cursor_bitmap_w,
         g_cursor_bitmap_h,
         visible,
         black,
-        white);
+        white,
+        xor_safe);
     return true;
 }
 

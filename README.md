@@ -63,7 +63,7 @@ $env:DRAWCURSOR_CANVAS_SIZE = "256"; .\build\DrawCursor.exe
 - 一次性 timer 使用绝对 QPC deadline 计算，避免提交耗时累积成周期漂移。没有新位移时不继续周期唤醒；timer 等待期间到达的多个输入会替换为最新代次，50ms timer 只做光标形状、显隐状态兜底和日志快照。
 - `UpdateLayeredWindow` 的目标 DC 为 `NULL`，热路径不再每帧 `GetDC(NULL)`。
 - 默认关闭完整逐帧 Profiling，热路径不会执行其 QPC 采样、原子聚合和日志写入；明确启用后，主线程每秒只提交内存快照，后台线程批量写盘，退出时才强制 flush。
-- 覆盖窗口启用 per-monitor DPI awareness、置顶、点击穿透和非激活样式；使用 32-bit premultiplied alpha。对于 I-beam、Cross 等无法由 alpha 直接表达的 XOR-only 光标，会转换为黑色主体加白色一像素轮廓，保证在亮色和暗色背景上都可见。
+- 覆盖窗口启用 per-monitor DPI awareness、置顶、点击穿透和非激活样式；使用 32-bit premultiplied alpha。对于 I-beam、Cross 等无法由 alpha 直接表达的 XOR-only 光标，会转换为中性灰主体加白色一像素轮廓；中性灰被真实系统光标再次反色后几乎不变，既避免本机叠加时发白闪烁，也让采集到的覆盖光标在亮暗背景上保持可见。
 - 监听系统菜单弹出事件，并在每次实际呈现后检查覆盖窗的 Z 序；只有发现另一个窗口确实排在它前面时，才重新置顶。这样既能处理右键菜单、下拉菜单，也能在 Windows 任务栏和快捷设置等非传统菜单抢占顶层顺序后恢复光标，同时避免正常帧反复重排窗口。
 
 ## Profiling

@@ -28,6 +28,7 @@
 #define CURSOR_CANVAS_SIZE_DEFAULT 384
 #define CURSOR_CANVAS_SIZE_EXPERIMENTAL 256
 #define CURSOR_CANVAS_MARGIN 32
+#define XOR_CURSOR_CORE_PIXEL 0xFF7F7F7F
 
 #define IDM_ENABLE 1001
 #define IDM_DISABLE 1002
@@ -35,6 +36,7 @@
 #define IDM_MODE_COMPAT 1004
 #define IDM_MODE_FAST 1005
 
+#define IDI_APP_ICON 101
 #define TRAY_ICON_ID 1
 
 #define RENDER_MODE_COMPAT 0
@@ -917,7 +919,7 @@ static bool GetMaskBit(const BYTE *bits, int stride, int x, int y)
     return (bits[y * stride + x / 8] & (BYTE)(0x80 >> (x % 8))) != 0;
 }
 
-static void ApplyHighContrastXorPixels(
+static void ApplyXorSafePixels(
     DWORD *pixels,
     const BYTE *xor_pixels,
     int width,
@@ -929,8 +931,11 @@ static void ApplyHighContrastXorPixels(
 
     /*
      * Per-pixel alpha cannot represent the invert operation used by classic
-     * XOR cursors. Draw a white one-pixel outline around a black core so the
-     * cursor remains visible on both light and dark backgrounds.
+     * XOR cursors. A black overlay core becomes bright white when the real
+     * hardware cursor inverts it, causing a conspicuous flash. Use neutral
+     * gray instead: bitwise inversion changes 0x7F only to 0x80, so the local
+     * cursor and the captured overlay look almost identical. The white
+     * one-pixel outline keeps the overlay visible on mixed backgrounds.
      */
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
@@ -960,7 +965,7 @@ static void ApplyHighContrastXorPixels(
 
     for (int i = 0; i < width * height; ++i) {
         if (xor_pixels[i]) {
-            pixels[i] = 0xFF000000;
+            pixels[i] = XOR_CURSOR_CORE_PIXEL;
         }
     }
 }
@@ -994,7 +999,7 @@ static void BuildCursorFromMonochromeMask(const BYTE *mask_bits, int mask_stride
     }
 
     if (xor_pixels) {
-        ApplyHighContrastXorPixels(
+        ApplyXorSafePixels(
             g_cursor_pixels,
             xor_pixels,
             g_cursor.width,
@@ -1078,7 +1083,7 @@ static bool BuildCursorBitmapPixels(void)
                 }
 
                 if (xor_pixels) {
-                    ApplyHighContrastXorPixels(
+                    ApplyXorSafePixels(
                         g_cursor_pixels,
                         xor_pixels,
                         g_cursor.width,
@@ -2228,7 +2233,7 @@ static bool AddTrayIcon(HWND hwnd)
     g_tray.uID = TRAY_ICON_ID;
     g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_tray.uCallbackMessage = WM_TRAYICON;
-    g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    g_tray.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
     lstrcpynW(g_tray.szTip, L"DrawCursor - 重绘已打开（兼容模式）", ARRAYSIZE(g_tray.szTip));
 
     return Shell_NotifyIconW(NIM_ADD, &g_tray) != FALSE;
@@ -2421,7 +2426,8 @@ static bool RegisterWindowClasses(void)
     main_class.cbSize = sizeof(main_class);
     main_class.lpfnWndProc = MainWindowProc;
     main_class.hInstance = g_instance;
-    main_class.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    main_class.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    main_class.hIconSm = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
     main_class.hCursor = LoadCursorW(NULL, IDC_ARROW);
     main_class.lpszClassName = MAIN_CLASS_NAME;
 
