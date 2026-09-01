@@ -19,7 +19,9 @@ DrawCursor 是一个 Windows 鼠标光标重绘工具。有些远程控制或录
 完成后，程序在这里：
 
 ```
-build\DrawCursor.exe
+build\DrawCursor-1.0.0.exe
 ```
 
 这个 exe 可以单独复制到其他电脑，不需要再带上源码或图标文件。
+
+发布新版本时，只需要修改项目根目录的 `VERSION` 文件。文件名和 exe 属性中的版本号会在构建时一起更新。

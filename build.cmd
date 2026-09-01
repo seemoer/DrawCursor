@@ -28,12 +28,33 @@ if not defined WINDRES (
 set "ROOT=%~dp0"
 set "BUILD_DIR=%ROOT%build"
 set "RESOURCE_OBJ=%BUILD_DIR%\resource.o"
-set "OUTPUT_EXE=%BUILD_DIR%\DrawCursor.exe"
+set "VERSION_HEADER=%BUILD_DIR%\version.h"
+
+if not exist "%ROOT%VERSION" (
+    echo VERSION file was not found.
+    goto :failed
+)
+set /p "APP_VERSION="<"%ROOT%VERSION"
+echo(%APP_VERSION%| findstr /r "^[0-9][0-9]*[.][0-9][0-9]*[.][0-9][0-9]*$" >nul
+if errorlevel 1 (
+    echo VERSION must use the format major.minor.patch, for example 1.0.0.
+    goto :failed
+)
+for /f "tokens=1-3 delims=." %%A in ("%APP_VERSION%") do (
+    set "VERSION_MAJOR=%%A"
+    set "VERSION_MINOR=%%B"
+    set "VERSION_PATCH=%%C"
+)
+set "OUTPUT_EXE=%BUILD_DIR%\DrawCursor-%APP_VERSION%.exe"
 
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
+>"%VERSION_HEADER%" echo #define DRAWCURSOR_VERSION_NUMERIC %VERSION_MAJOR%,%VERSION_MINOR%,%VERSION_PATCH%,0
+>>"%VERSION_HEADER%" echo #define DRAWCURSOR_VERSION_STRING "%APP_VERSION%"
+>>"%VERSION_HEADER%" echo #define DRAWCURSOR_ORIGINAL_FILENAME "DrawCursor-%APP_VERSION%.exe"
+
 pushd "%ROOT%res"
-"%WINDRES%" --input-format=rc --output-format=coff --codepage=65001 -i "resource.rc" -o "%RESOURCE_OBJ%"
+"%WINDRES%" --input-format=rc --output-format=coff --codepage=65001 -I "%BUILD_DIR%" -i "resource.rc" -o "%RESOURCE_OBJ%"
 set "BUILD_RESULT=%ERRORLEVEL%"
 popd
 if not "%BUILD_RESULT%"=="0" goto :failed
@@ -41,6 +62,7 @@ if not "%BUILD_RESULT%"=="0" goto :failed
 "%GCC%" "%ROOT%src\main.c" "%RESOURCE_OBJ%" -o "%OUTPUT_EXE%" -O2 -Wall -Wextra -municode -mwindows -finput-charset=UTF-8 -lshell32 -luser32 -lgdi32
 set "BUILD_RESULT=%ERRORLEVEL%"
 if exist "%RESOURCE_OBJ%" del /q "%RESOURCE_OBJ%"
+if exist "%VERSION_HEADER%" del /q "%VERSION_HEADER%"
 if not "%BUILD_RESULT%"=="0" goto :failed
 
 echo.
@@ -130,6 +152,7 @@ exit /b 0
 
 :failed
 if defined RESOURCE_OBJ if exist "%RESOURCE_OBJ%" del /q "%RESOURCE_OBJ%"
+if defined VERSION_HEADER if exist "%VERSION_HEADER%" del /q "%VERSION_HEADER%"
 echo.
 echo Build failed.
 set "BUILD_RESULT=1"

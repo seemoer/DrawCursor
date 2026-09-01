@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <winver.h>
+#include "version.h"
 
 #define IDI_APP_ICON 101
 
@@ -8,8 +9,8 @@ IDI_APP_ICON ICON "drawcursor.ico"
 1 RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION DRAWCURSOR_VERSION_NUMERIC
+ PRODUCTVERSION DRAWCURSOR_VERSION_NUMERIC
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -26,11 +27,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "DrawCursor"
             VALUE "FileDescription", "DrawCursor mouse pointer redraw utility"
-            VALUE "FileVersion", "1.0.0"
+            VALUE "FileVersion", DRAWCURSOR_VERSION_STRING
             VALUE "InternalName", "DrawCursor"
-            VALUE "OriginalFilename", "DrawCursor.exe"
+            VALUE "OriginalFilename", DRAWCURSOR_ORIGINAL_FILENAME
             VALUE "ProductName", "DrawCursor"
-            VALUE "ProductVersion", "1.0.0"
+            VALUE "ProductVersion", DRAWCURSOR_VERSION_STRING
         END
     END
     BLOCK "VarFileInfo"
